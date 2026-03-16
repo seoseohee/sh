@@ -1,0 +1,627 @@
+"""
+ecc_core/executor.py
+
+LLM이 요청한 tool_use를 실제 보드 명령으로 실행한다.
+
+CC tool → ECC 대응:
+  CC Bash(local)          → bash(SSH remote) + script(upload+run)
+  CC Read(local file)     → read(remote path via SSH cat)
+  CC Write(local file)    → write(upload content via SSH) + script(interpreter)
+  CC TaskOutput(async)    → bash(background=True) + bash_wait()
+  [ECC 전용] ssh_connect  → BoardDiscovery.scan / from_hint
+  [ECC 전용] probe        → PROBE_COMMANDS 매핑 (hw/sw/net/motors/lidar/parallel_scan)
+  [ECC 전용] verify       → VERIFY_COMMANDS 매핑 (serial/i2c/ros2/process/system)
+  [ECC 전용] done         → is_finished=True + 터미널 출력
+
+실패 처리 철학:
+  CC: 로컬 명령 실패 → 예외 발생
+  ECC: SSH 명령 실패 → ExecResult(ok=False) → tool_result에 에러 내용 포함
+  실패는 '예외'가 아닌 '정보' — LLM이 다음 행동을 결정
+
+Level 1 자동 재시도:
+  bash()에서 SSH timeout(rc=-1) 발생 시 timeout을 2배로 늘려 1회 재시도.
+  일시적 네트워크 불안정을 자동 흡수. 재시도 후에도 실패하면 LLM이 판단.
+"""
+
+import json
+import os
+import subprocess
+import threading
+import uuid as _uuid_mod
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from .connection import BoardConnection, ExecResult
+from .tools import is_dangerous, PROBE_COMMANDS, VERIFY_COMMANDS
+from .todo import TodoManager
+
+if TYPE_CHECKING:
+    pass
+
+
+# ── 백그라운드 task 저장소 ─────────────────────────────────────────
+
+@dataclass
+class _BgTask:
+    task_id: str
+    cmd: str
+    result: "ExecResult | None" = field(default=None)
+    done: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def set_result(self, r: "ExecResult") -> None:
+        with self._lock:
+            self.result = r
+            self.done = True
+
+    def wait(self, timeout: float) -> bool:
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.done:
+                return True
+            time.sleep(0.2)
+        return self.done
+
+
+class ToolExecutor:
+    """
+    각 도구 이름을 받아서 실제 동작으로 디스패치.
+    done이 호출되면 is_finished = True.
+
+    v5: conn은 None일 수 있다.
+    loop.py가 ssh_connect 후 executor.conn을 갱신해준다.
+    conn=None 상태에서 bash 등을 호출하면 loop.py에서 먼저 차단되므로
+    여기서는 conn이 있다고 가정해도 된다.
+    """
+
+    def __init__(self, conn, todos: TodoManager, memory=None, verbose: bool = False):
+        self.conn = conn
+        self.todos = todos
+        self.memory = memory   # ECCMemory | None
+        self.verbose = verbose
+        self.is_finished = False
+        self._bg_tasks: dict[str, _BgTask] = {}
+        self._serial_sessions: dict[str, dict] = {}
+
+    def execute(self, tool_name: str, tool_input: dict) -> str:
+        """
+        tool_name에 따라 실행하고 결과 문자열 반환.
+        반환값은 LLM의 tool_result content가 된다.
+
+        dispatch는 getattr 기반 — 하드코딩 테이블 없음.
+        """
+        handler = getattr(self, f"_{tool_name}", None)
+        if handler is None:
+            return (
+                f"[error] 알 수 없는 도구: {tool_name}\n"
+                f"사용 가능한 도구: "
+                + ", ".join(
+                    n[1:] for n in dir(self)
+                    if n.startswith("_") and not n.startswith("__")
+                    and callable(getattr(self, n))
+                    and n[1:] not in ("bg_tasks", "serial_sessions")
+                )
+            )
+        return handler(tool_input)
+
+    # ─── bash ──────────────────────────────────────────────────
+
+    def _bash(self, inp: dict) -> str:
+        cmd = inp["command"]
+        timeout = inp.get("timeout", 30)
+        desc = inp.get("description", "")
+        background = inp.get("background", False)
+
+        _print_tool("bash", f"{cmd[:100]}", desc)
+
+        if is_dangerous(cmd):
+            return "[blocked] 위험한 명령으로 판단되어 실행을 거부했습니다."
+
+        if background:
+            task_id = _uuid_mod.uuid4().hex[:8]
+            task = _BgTask(task_id=task_id, cmd=cmd)
+            self._bg_tasks[task_id] = task
+
+            def _run():
+                r = self.conn.run(cmd, timeout=timeout)
+                task.set_result(r)
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            print(f"    ⏳ background task_id={task_id}", flush=True)
+            return (
+                f"[background] task_id={task_id}\n"
+                f"Command is running in background. "
+                f"Use bash_wait(task_id='{task_id}') to retrieve the result."
+            )
+
+        if self.conn is None:
+            result = _local_run(cmd, timeout=timeout)
+        else:
+            result = self.conn.run(cmd, timeout=timeout)
+
+            # ── Level 1 자동 재시도 (일시적 timeout 흡수) ──────────
+            # rc=-1 + "timeout" 메시지 → 2배 timeout으로 1회 재시도
+            # 같은 실수 반복 방지: rc=1 (명령 오류) 는 재시도하지 않음
+            if (
+                not result.ok
+                and result.rc == -1
+                and "timeout" in result.stderr.lower()
+                and not background
+            ):
+                retry_timeout = min(timeout * 2, 120)
+                print(
+                    f"    ⟳ timeout 감지 — {retry_timeout}s로 재시도...",
+                    flush=True
+                )
+                result = self.conn.run(cmd, timeout=retry_timeout)
+            # ────────────────────────────────────────────────────────
+
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── bash_wait ─────────────────────────────────────────────
+
+    def _bash_wait(self, inp: dict) -> str:
+        task_id = inp["task_id"]
+        wait_timeout = inp.get("timeout", 120)
+        desc = inp.get("description", "")
+
+        _print_tool("bash_wait", f"task_id={task_id}", desc)
+
+        task = self._bg_tasks.get(task_id)
+        if task is None:
+            return f"[error] task_id '{task_id}' not found. Valid IDs: {list(self._bg_tasks.keys())}"
+
+        finished = task.wait(timeout=wait_timeout)
+        if not finished:
+            return (
+                f"[timeout] task_id={task_id} is still running after {wait_timeout}s.\n"
+                "Call bash_wait again with a longer timeout, or continue other work."
+            )
+
+        result = task.result
+        del self._bg_tasks[task_id]
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── script ────────────────────────────────────────────────
+
+    def _script(self, inp: dict) -> str:
+        code = inp["code"]
+        interpreter = inp.get("interpreter", "bash")
+        timeout = inp.get("timeout", 60)
+        desc = inp.get("description", "")
+
+        lines = code.strip().splitlines()
+        _print_tool("script", f"[{interpreter}] {len(lines)}줄", desc)
+
+        if self.verbose:
+            preview = "\n    ".join(lines[:6])
+            suffix = "\n    ..." if len(lines) > 6 else ""
+            print(f"    {preview}{suffix}")
+
+        result = self.conn.upload_and_run(code, interpreter=interpreter, timeout=timeout)
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── read ──────────────────────────────────────────────────
+
+    def _read(self, inp: dict) -> str:
+        path = inp["path"]
+        head = inp.get("head_lines", 0)
+        tail = inp.get("tail_lines", 0)
+
+        _print_tool("read", path)
+
+        if head > 0:
+            cmd = f"head -n {head} {path}"
+        elif tail > 0:
+            cmd = f"tail -n {tail} {path}"
+        else:
+            cmd = f"cat {path}"
+
+        if self.conn is None:
+            result = _local_run(cmd, timeout=15)
+        else:
+            result = self.conn.run(cmd, timeout=15)
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── write ─────────────────────────────────────────────────
+
+    def _write(self, inp: dict) -> str:
+        path = inp["path"]
+        content = inp["content"]
+        mode = inp.get("mode", "")
+
+        _print_tool("write", path)
+
+        if self.conn is None:
+            result = _local_write(path, content, mode)
+            _print_result(result)
+            return result.to_tool_result()
+
+        result = self.conn.upload_and_run(
+            f"mkdir -p $(dirname {path})",
+            interpreter="bash",
+            timeout=10
+        )
+
+        result = self.conn.upload_and_run(
+            content,
+            interpreter=f"bash -c 'cat > {path}'",
+            timeout=15
+        )
+
+        if result.ok and mode:
+            self.conn.run(f"chmod {mode} {path}", timeout=5)
+
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── glob ──────────────────────────────────────────────────
+
+    def _glob(self, inp: dict) -> str:
+        pattern = inp["pattern"]
+        base = inp.get("base_dir", "/")
+
+        _print_tool("glob", pattern)
+
+        if pattern.startswith("/"):
+            cmd = f"find / -path '{pattern}' 2>/dev/null | head -50"
+        else:
+            cmd = f"find {base} -path '*{pattern}*' 2>/dev/null | head -50"
+
+        if self.conn is None:
+            result = _local_run(cmd, timeout=20)
+        else:
+            result = self.conn.run(cmd, timeout=20)
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── grep ──────────────────────────────────────────────────
+
+    def _grep(self, inp: dict) -> str:
+        pattern = inp["pattern"]
+        path = inp["path"]
+        flags = inp.get("flags", "-rn")
+        max_results = inp.get("max_results", 50)
+
+        _print_tool("grep", f'"{pattern}" in {path}')
+
+        cmd = (
+            f"(rg {flags} --max-count {max_results} '{pattern}' {path} 2>/dev/null) "
+            f"|| (grep {flags} --max-count {max_results} '{pattern}' {path} 2>/dev/null)"
+        )
+        if self.conn is None:
+            result = _local_run(cmd, timeout=20)
+        else:
+            result = self.conn.run(cmd, timeout=20)
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── probe ─────────────────────────────────────────────────
+
+    def _probe(self, inp: dict) -> str:
+        target = inp["target"]
+
+        _print_tool("probe", f"[{target}]", "하드웨어/환경 탐지")
+
+        cmd = PROBE_COMMANDS.get(target)
+        if not cmd:
+            return f"[error] 알 수 없는 probe target: {target}"
+
+        timeout = 60 if target == "parallel_scan" else 45
+        result = self.conn.run(cmd, timeout=timeout)
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── serial_open ───────────────────────────────────────────
+
+    def _serial_open(self, inp: dict) -> str:
+        port     = inp["port"]
+        baudrate = inp.get("baudrate", 115200)
+        timeout  = inp.get("timeout", 1.0)
+        desc     = inp.get("description", "")
+
+        _print_tool("serial_open", f"{port} @ {baudrate}", desc)
+
+        session_id = _uuid_mod.uuid4().hex[:8]
+        self._serial_sessions[session_id] = {
+            "port":     port,
+            "baudrate": baudrate,
+            "timeout":  timeout,
+            "desc":     desc,
+            "history":  [],
+        }
+
+        check = self.conn.run(
+            f"python3 -c \""
+            f"import serial; s=serial.Serial('{port}', {baudrate}, timeout={timeout}); "
+            f"s.close(); print('ok')\"",
+            timeout=10
+        )
+        if not check.ok:
+            del self._serial_sessions[session_id]
+            _print_result(check)
+            return (
+                f"[serial_open failed] {port} @ {baudrate}\n"
+                f"{check.to_tool_result()}\n"
+                "Hints:\n"
+                "- 포트 경로 확인: probe(target='hw')\n"
+                "- 권한 확인: bash('ls -la /dev/ttyACM* /dev/ttyUSB*')\n"
+                "- pyserial 설치: bash('pip3 install pyserial --break-system-packages')"
+            )
+
+        print(f"    ✅ serial session_id={session_id}  ({port} @ {baudrate})", flush=True)
+        return (
+            f"[serial_open ok] session_id={session_id}\n"
+            f"port={port} baudrate={baudrate} timeout={timeout}\n"
+            f"Use serial_send(session_id='{session_id}', data=...) to communicate."
+        )
+
+    # ─── serial_send ───────────────────────────────────────────
+
+    def _serial_send(self, inp: dict) -> str:
+        session_id = inp["session_id"]
+        data       = inp["data"]
+        expect     = inp.get("expect", "")
+        timeout    = inp.get("timeout", 2.0)
+        hex_encode = inp.get("hex_encode", False)
+
+        _print_tool("serial_send", f"session={session_id}", f"data={data[:40]!r}")
+
+        sess = self._serial_sessions.get(session_id)
+        if not sess:
+            return (
+                f"[error] session_id '{session_id}' not found.\n"
+                f"Valid sessions: {list(self._serial_sessions.keys())}\n"
+                "Call serial_open first."
+            )
+
+        port      = sess["port"]
+        baudrate  = sess["baudrate"]
+        s_timeout = sess["timeout"]
+
+        if hex_encode:
+            send_expr = f"bytes.fromhex('{data.replace(' ', '')}')"
+        else:
+            data_escaped = data.replace("'", "\\'")
+            send_expr = f"'{data_escaped}'.encode().decode('unicode_escape').encode('latin1')"
+
+        if expect:
+            recv_code = (
+                f"buf=b''; deadline=time.time()+{timeout}\n"
+                f"    while time.time()<deadline:\n"
+                f"        chunk=s.read(s.in_waiting or 1)\n"
+                f"        if chunk: buf+=chunk\n"
+                f"        if b{expect!r} in buf: break\n"
+                f"        time.sleep(0.01)\n"
+            )
+        else:
+            recv_code = (
+                f"time.sleep({timeout})\n"
+                f"    buf=s.read(s.in_waiting or 1)\n"
+            )
+
+        script = (
+            f"import serial, time\n"
+            f"s = serial.Serial('{port}', {baudrate}, timeout={s_timeout})\n"
+            f"tx = {send_expr}\n"
+            f"s.write(tx)\n"
+            f"s.flush()\n"
+            f"{recv_code}"
+            f"s.close()\n"
+            f"print('TX:', tx)\n"
+            f"print('RX:', buf)\n"
+            f"print('RX_TEXT:', buf.decode('utf-8', errors='replace'))\n"
+        )
+
+        result = self.conn.upload_and_run(script, interpreter="python3", timeout=int(timeout) + 5)
+        _print_result(result)
+
+        out = result.output()
+        sess["history"].append({"tx": data, "rx": out, "hex": hex_encode})
+        if len(sess["history"]) > 50:
+            sess["history"].pop(0)
+
+        return result.to_tool_result()
+
+    # ─── serial_close ──────────────────────────────────────────
+
+    def _serial_close(self, inp: dict) -> str:
+        session_id = inp.get("session_id", "")
+
+        if not session_id:
+            n = len(self._serial_sessions)
+            self._serial_sessions.clear()
+            _print_tool("serial_close", "all", f"{n}개 세션 닫기")
+            return f"[serial_close] {n}개 세션 모두 닫음."
+
+        _print_tool("serial_close", f"session={session_id}")
+
+        if session_id not in self._serial_sessions:
+            return f"[error] session_id '{session_id}' not found."
+
+        sess = self._serial_sessions.pop(session_id)
+        history_count = len(sess["history"])
+        print(f"    ✅ closed {sess['port']} (송수신 {history_count}회)", flush=True)
+        return (
+            f"[serial_close ok] session_id={session_id} closed.\n"
+            f"port={sess['port']} | total io={history_count}"
+        )
+
+    # ─── todo ──────────────────────────────────────────────────
+
+    def _todo(self, inp: dict) -> str:
+        todos = inp.get("todos", [])
+        self.todos.update(todos)
+        formatted = self.todos.format_display()
+        print(f"\n{formatted}")
+        return f"[ok] todo 업데이트됨\n{self.todos.format_for_llm()}"
+
+    # ─── remember ──────────────────────────────────────────────
+
+    def _remember(self, inp: dict) -> str:
+        """발견한 사실을 Semantic Memory에 영속 저장.
+
+        에이전트가 probe/verify/bash 결과에서 중요 사실을 발견하면
+        이 도구를 호출해서 세션 간에 보존한다.
+        다음 세션에서 동일 보드에 연결하면 자동으로 복원됨.
+        """
+        ns    = inp.get("namespace", "hardware")
+        key   = inp.get("key", "").strip()
+        value = inp.get("value")
+
+        if not key:
+            return "[error] remember: key는 필수입니다"
+
+        if self.memory is None:
+            return "[warn] remember: memory가 초기화되지 않음. ssh_connect 후 호출하세요"
+
+        self.memory.remember(ns, key, value)
+        _print_tool("remember", f"[{ns}] {key} = {value}")
+        return f"[ok] remembered: [{ns}] {key} = {value}"
+
+    def _verify(self, inp: dict) -> str:
+        target = inp["target"]
+        device = inp.get("device", "")
+
+        _print_tool("verify", f"[{target}] {device}", "동작 확인")
+
+        if target == "custom":
+            if device:
+                result = self.conn.run(device, timeout=30)
+            else:
+                return "[error] custom verify: device에 확인할 bash 명령을 넣어라"
+            _print_result(result)
+            return result.to_tool_result()
+
+        cmd_template = VERIFY_COMMANDS.get(target)
+        if not cmd_template:
+            return f"[error] 알 수 없는 verify target: {target}"
+
+        cmd = f"export ECC_DEVICE='{device}'\n{cmd_template}"
+        result = self.conn.run(cmd, timeout=60)
+        _print_result(result)
+
+        out = result.to_tool_result()
+        summary = " | ".join(
+            l.strip() for l in result.output().splitlines()
+            if any(k in l for k in ("PASS", "FAIL", "WARN", "OK"))
+        )[:200]
+        return (f"[verify:{target} {device}] {summary}\n\n{out}") if summary else out
+
+    # ─── subagent ──────────────────────────────────────────────
+
+    def _subagent(self, inp: dict) -> str:
+        return "[error] subagent must be handled by AgentLoop, not ToolExecutor"
+
+    # ─── done ──────────────────────────────────────────────────
+
+    def _done(self, inp: dict) -> str:
+        success = inp.get("success", False)
+        summary = inp.get("summary", "")
+        evidence = inp.get("evidence", "")
+        notes = inp.get("notes", "")
+
+        if self._serial_sessions:
+            n = len(self._serial_sessions)
+            print(f"\n  🔌 열린 serial 세션 {n}개 자동 닫기...", flush=True)
+            self._serial_sessions.clear()
+
+        icon = "✅" if success else "❌"
+        print(f"\n{'═'*60}")
+        print(f"  {icon}  {summary}")
+        if evidence:
+            print(f"  🔍 Evidence: {evidence}")
+        if notes:
+            print(f"  📝 {notes}")
+        print(f"{'═'*60}")
+
+        self.is_finished = True
+        return "done"
+
+
+# ─────────────────────────────────────────────────────────────
+# 로컬 실행 헬퍼
+# ─────────────────────────────────────────────────────────────
+
+def _local_run(cmd: str, timeout: int = 30) -> ExecResult:
+    import time
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout
+        )
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return ExecResult(
+            ok=r.returncode == 0,
+            stdout=r.stdout, stderr=r.stderr,
+            rc=r.returncode, duration_ms=elapsed,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return ExecResult(ok=False, stdout="", stderr=f"local timeout after {timeout}s", rc=-1, duration_ms=elapsed)
+    except Exception as e:
+        return ExecResult(ok=False, stdout="", stderr=str(e), rc=-1)
+
+
+def _local_write(path: str, content: str, mode: str = "") -> ExecResult:
+    import time
+    t0 = time.monotonic()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        if mode:
+            os.chmod(path, int(mode, 8))
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return ExecResult(ok=True, stdout=f"written {len(content)} bytes to {path}", stderr="", rc=0, duration_ms=elapsed)
+    except Exception as e:
+        return ExecResult(ok=False, stdout="", stderr=str(e), rc=1)
+
+
+    # ─── ask_user ───────────────────────────────────────────────
+
+    def _ask_user(self, inp: dict) -> str:
+        question = inp["question"]
+        context = inp.get("context", "")
+
+        print("\n" + "─" * 60, flush=True)
+        if context:
+            print(f"  ℹ️  {context}", flush=True)
+        print(f"  ❓ {question}", flush=True)
+        print("─" * 60, flush=True)
+        try:
+            answer = input("  답변: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+            print("\n  (입력 없음 — 빈 답변으로 처리)", flush=True)
+
+        if not answer:
+            return "[ask_user] No answer provided. Proceed with best-effort assumption."
+        return f"[ask_user] User answered: {answer}"
+
+
+# ─────────────────────────────────────────────────────────────
+# 출력 헬퍼
+# ─────────────────────────────────────────────────────────────
+
+def _print_tool(name: str, detail: str = "", desc: str = ""):
+    desc_str = f"  # {desc}" if desc else ""
+    print(f"\n  ▶ {name}  {detail}{desc_str}", flush=True)
+
+def _print_result(result: ExecResult, max_chars: int = 4000):
+    out = result.output()
+    if not out.strip():
+        return
+    if len(out) > max_chars:
+        head = out[:max_chars // 2]
+        tail = out[-(max_chars // 4):]
+        out = f"{head}\n  ...({len(out)}자 truncated)...\n{tail}"
+    for line in out.splitlines():
+        print(f"  {line}", flush=True)
