@@ -287,6 +287,22 @@ class ToolDispatcher:
         print(f"\n  🔗 ssh_connect: host={host} user={user or 'auto'} port={port}", flush=True)
 
         if host.lower() == "scan" or not host:
+            # v4: SSH 프로파일 캐시 먼저 시도 (탐색 시간 절감)
+            loop = self._loop
+            if hasattr(loop, '_session') and loop._session._saved_memory:
+                profile = loop._session._saved_memory.get_ssh_profile()
+                if profile:
+                    cached_host = profile.get("host_port", "").split(":")[0]
+                    cached_user = profile.get("user", "")
+                    cached_port = int(profile.get("host_port", ":22").split(":")[-1]) if ":" in profile.get("host_port", "") else 22
+                    if cached_host:
+                        print(f"  ⚡ SSH 프로파일 캐시 시도: {cached_user}@{cached_host}:{cached_port}", flush=True)
+                        conn = BoardDiscovery.from_hint(cached_host, cached_user, cached_port)
+                        if conn:
+                            self._loop.conn = conn
+                            print(f"  ✅ 캐시 연결 성공: {conn.address}")
+                            return f"[ssh_connect ok] Connected to {conn.address} (cached)"
+
             print("  🔍 네트워크 자동 탐색 중...", flush=True)
             conn = BoardDiscovery.scan(user=user, port=port)
             if conn:

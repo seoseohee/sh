@@ -34,9 +34,11 @@ from .reflection  import (classify_failure, generate_reflection,
                           make_reflection_message, route_from_verifier, ReplanDecision)
 from .observation import collect_observation
 from .verifier    import verify_execution, verify_motion, parse_error_feedback
-from .escalation  import EscalationTracker
-from .session     import SessionManager
-from .dispatcher  import ToolDispatcher, SubagentRole, run_subagent  # noqa: F401 (re-export)
+from .escalation    import EscalationTracker
+from .session       import SessionManager
+from .dispatcher    import ToolDispatcher, SubagentRole, run_subagent  # noqa: F401 (re-export)
+from .consolidation import consolidate_episodic
+from .goal_history  import record_goal
 
 
 # ─────────────────────────────────────────────────────────────
@@ -210,11 +212,14 @@ class AgentLoop:
             conn_status = (
                 f"[Connected: {self.conn.address}]" if self.conn else "[Not connected]"
             )
+            # v4: 현재 tool 실행 컨텍스트를 쿼리로 사용해 관련 메모리만 주입
+            _mem_query = f"{active_goal} {memory.working.current_step} {memory.working.last_action}"
             system_with_state = (
                 system
                 + f"\n\nCurrent connection: {conn_status}"
-                + (f"\n\n{memory.to_system_context()}" if memory.to_system_context() else "")
-                + (f"\n\n{todos.format_nag()}"          if todos.format_nag()          else "")
+                + (f"\n\n{memory.to_system_context(query=_mem_query)}"
+                   if memory.to_system_context(query=_mem_query) else "")
+                + (f"\n\n{todos.format_nag()}" if todos.format_nag() else "")
             )
 
             # ── LLM 호출 ───────────────────────────────────────
@@ -385,8 +390,22 @@ class AgentLoop:
             if executor.is_finished:
                 state.messages = messages
                 self._session.save(state)
-                memory.checkpoint_clear()  # 완료된 세션의 체크포인트 삭제
+                memory.checkpoint_clear()
+
+                # v4: Episodic → Semantic 자동 통합
+                consolidate_episodic(memory, active_goal, self.client)
+
+                # v4: 세션 비용 집계 + goal 이력 기록
+                tok_in, tok_out = tracer.get_token_totals()
                 tracer.session_end(success=True, summary=f"done() after {turn} turns")
+                record_goal(
+                    goal=active_goal,
+                    success=True,
+                    turns=turn,
+                    conn_address=self.conn.address if self.conn else "",
+                    tokens_in=tok_in,
+                    tokens_out=tok_out,
+                )
                 break
 
             if self.conn and turn > 0 and turn % 10 == 0:

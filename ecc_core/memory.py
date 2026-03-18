@@ -1,18 +1,23 @@
 """
-ecc_core/memory.py
+ecc_core/memory.py — ECCMemory 3-tier (v4)
 
-ECCMemory — 3-tier memory architecture (Sumers et al., TPAMI 2024)
+변경 이력:
+  v2 — dirty flag 배치 저장
+  v3 — checkpoint (Working + Episodic 휘발성 보존)
+  v4 — 논문 기반 4개 개선
+       ① Episode 중요도 점수 + recency×importance×relevance 검색
+       ② Episodic 인과 체인 (caused_by 링크)
+       ③ Semantic 쿼리 기반 필터 검색 (retrieve_relevant)
+       ④ SSH 프로파일 캐싱 (hardware.ssh_profile → 재연결 가속)
 
-수정 이력:
-  v2 — dirty flag 기반 배치 저장.
-       기존: remember() 호출마다 전체 JSON 디스크 write → probe 결과 10개
-       저장 시 10회 I/O 발생.
-       수정: _dirty flag로 변경 여부 추적, save() 는 _dirty일 때만 write.
-       remember()는 즉시 디스크 저장 대신 dirty 표시 + flush_if_dirty() 제공.
-       loop.py의 done() 및 세션 종료 시점에 save() 호출.
+참고 논문:
+  - Generative Agents (Park et al., 2023): recency×importance×relevance 공식
+  - MAGMA (Jiang et al., 2026): 인과 그래프 표현
+  - AgeMem (Yu et al., 2026): 메모리 연산을 에이전트 도구로
 """
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,12 +30,12 @@ from typing import Optional
 
 @dataclass
 class WorkingMemory:
-    goal: str = ""
+    goal:         str = ""
     current_step: str = ""
     conn_address: str = ""
-    turn: int = 0
-    last_action: str = ""
-    last_result: str = ""
+    turn:         int = 0
+    last_action:  str = ""
+    last_result:  str = ""
 
     def to_context(self) -> str:
         parts = []
@@ -46,23 +51,85 @@ class WorkingMemory:
 
 
 # ─────────────────────────────────────────────────────────────
-# Episodic Memory
+# Episodic Memory — 중요도 + 인과 체인 (v4)
 # ─────────────────────────────────────────────────────────────
+
+# 도구별 기본 중요도 (0~1)
+_TOOL_IMPORTANCE: dict[str, float] = {
+    "ssh_connect":  0.9,   # 연결 이벤트 — 항상 중요
+    "probe":        0.8,   # 하드웨어 발견
+    "verify":       0.8,   # 검증 결과
+    "remember":     0.9,   # 명시적 저장 = 중요
+    "done":         1.0,   # 세션 종료
+    "serial_open":  0.7,
+    "script":       0.5,
+    "bash":         0.3,   # 일반 명령 — 낮음
+    "todo":         0.2,   # 상태 업데이트 — 낮음
+}
+_RECENCY_DECAY = 0.995     # turn 단위 감쇠 (0.995^100 ≈ 0.6)
+
 
 @dataclass
 class Episode:
-    ts: float
-    tool: str
-    summary: str
-    ok: bool
+    ts:         float
+    tool:       str
+    summary:    str
+    ok:         bool
+    importance: float = 0.5   # 0~1
+    caused_by:  str   = ""    # 인과 링크: 이전 episode 식별자 (tool:summary[:30])
+    turn:       int   = 0     # 발생 turn 번호
 
     @classmethod
-    def from_result(cls, tool: str, result_text: str, ok: bool) -> "Episode":
+    def from_result(
+        cls,
+        tool:       str,
+        result_text: str,
+        ok:         bool,
+        turn:       int  = 0,
+        caused_by:  str  = "",
+    ) -> "Episode":
+        # 도구별 기본 중요도
+        base = _TOOL_IMPORTANCE.get(tool, 0.4)
+        # 실패는 중요도 +0.2 (재시도 방지 학습에 더 중요)
+        importance = min(1.0, base + (0.2 if not ok else 0.0))
+        # 첫 발견(하드웨어 경로, IP 등)은 추가 boost
+        if any(k in result_text for k in ("/dev/", "PASS", "connected", "found")):
+            importance = min(1.0, importance + 0.15)
+
         return cls(
             ts=time.time(),
             tool=tool,
             summary=result_text[:120].replace("\n", " "),
             ok=ok,
+            importance=importance,
+            caused_by=caused_by,
+            turn=turn,
+        )
+
+    def id(self) -> str:
+        """인과 링크용 식별자."""
+        return f"{self.tool}:{self.summary[:30]}"
+
+    def recency_score(self, current_turn: int) -> float:
+        """현재 turn 기준 recency 점수 (감쇠 함수)."""
+        delta = max(0, current_turn - self.turn)
+        return _RECENCY_DECAY ** delta
+
+    def relevance_score(self, query: str) -> float:
+        """쿼리와의 키워드 겹침 기반 관련도 (0~1)."""
+        q_words = set(query.lower().split())
+        e_words = set((self.tool + " " + self.summary).lower().split())
+        if not q_words:
+            return 0.0
+        overlap = len(q_words & e_words)
+        return min(1.0, overlap / max(1, len(q_words)) * 2)
+
+    def retrieval_score(self, query: str, current_turn: int) -> float:
+        """Generative Agents 공식: recency × importance × relevance."""
+        return (
+            self.recency_score(current_turn)
+            * self.importance
+            * max(0.1, self.relevance_score(query))
         )
 
 
@@ -105,6 +172,34 @@ class SemanticStore:
             return ""
         return "[Board memory — do not rediscover]\n" + "\n".join(lines)
 
+    def query_relevant(self, query: str, top_k: int = 6) -> str:
+        """
+        쿼리와 관련된 Semantic 메모리만 필터링 반환.
+
+        v4: 전체 dump 대신 키워드 overlap 기반 선택적 주입.
+        제안 4 (쿼리 기반 Semantic 검색) 구현.
+        """
+        q_words = set(query.lower().split())
+        scored: list[tuple[float, str, str, object]] = []
+
+        # constraints/failed 항상 우선 포함
+        for ns in ("constraints", "failed"):
+            for k, v in self._d.get(ns, {}).items():
+                scored.append((10.0, ns, k, v))  # 최우선
+
+        for ns in ("hardware", "protocol", "skill"):
+            for k, v in self._d.get(ns, {}).items():
+                text = (k + " " + str(v)).lower()
+                overlap = sum(1 for w in q_words if w in text)
+                if overlap > 0:
+                    scored.append((float(overlap), ns, k, v))
+
+        scored.sort(key=lambda x: -x[0])
+        if not scored:
+            return ""
+        lines = [f"  [{ns}] {k} = {str(v)[:100]}" for _, ns, k, v in scored[:top_k]]
+        return "[Board memory — relevant to current task]\n" + "\n".join(lines)
+
     @property
     def hardware(self) -> dict:
         return self._d["hardware"]
@@ -132,21 +227,20 @@ class SemanticStore:
 
 class ECCMemory:
     """
-    3-tier 메모리 컨테이너.
+    3-tier 메모리 컨테이너 v4.
 
-    FIX v2: dirty flag 기반 배치 저장.
-    - remember() 는 메모리에만 쓰고 _dirty = True 로 표시.
-    - save() 는 _dirty 일 때만 디스크 write.
-    - flush_if_dirty() 는 선택적 중간 저장용 (중요 사실 발견 후 즉시 보존).
-    - 루프에서 done() 호출 시 및 KeyboardInterrupt 시 save() 호출.
+    Working  — 현재 turn 컨텍스트 (휘발)
+    Episodic — 이번 세션 사건 기록 (중요도+인과+검색)
+    Semantic — 보드별 영속 지식 (dirty flag, 체크포인트)
     """
 
     def __init__(self, conn_address: str = ""):
-        self.working = WorkingMemory()
+        self.working   = WorkingMemory()
         self.episodic: list[Episode] = []
-        self.semantic = SemanticStore()
+        self.semantic  = SemanticStore()
         self._conn_address = ""
-        self._dirty = False
+        self._dirty    = False
+        self._last_episode_id: str = ""   # 인과 체인용
 
         if conn_address:
             self.update_connection(conn_address)
@@ -156,7 +250,6 @@ class ECCMemory:
     def update_connection(self, conn_address: str) -> None:
         if self._conn_address == conn_address:
             return
-        # 연결 변경 전 현재 dirty 데이터 저장
         if self._dirty and self._conn_address:
             self.save()
         self._conn_address = conn_address
@@ -164,18 +257,30 @@ class ECCMemory:
         self._load(conn_address)
         self._dirty = False
 
+        # v4: SSH 프로파일 캐싱 — 연결 성공 시 자동 저장
+        if conn_address:
+            parts = conn_address.split("@")
+            if len(parts) == 2:
+                user_part = parts[0]
+                host_port = parts[1]
+                self.semantic.set("hardware", "ssh_profile", {
+                    "user": user_part,
+                    "host_port": host_port,
+                    "last_connected": time.time(),
+                })
+                self._dirty = True
+
     # ── 영속 저장/로드 ─────────────────────────────────────────
 
     def _path(self, addr: str) -> Path:
         key = addr.replace("@", "_at_").replace(":", "_port_").replace("/", "_")
-        p = Path(f"~/.ecc/memory/{key}.json").expanduser()
+        p   = Path(f"~/.ecc/memory/{key}.json").expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
     def _checkpoint_path(self, addr: str) -> Path:
-        """Working + Episodic 체크포인트 파일 경로."""
         key = addr.replace("@", "_at_").replace(":", "_port_").replace("/", "_")
-        p = Path(f"~/.ecc/memory/{key}.checkpoint.json").expanduser()
+        p   = Path(f"~/.ecc/memory/{key}.checkpoint.json").expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
@@ -189,13 +294,7 @@ class ECCMemory:
                 pass
 
     def save(self) -> None:
-        """
-        Semantic memory를 디스크에 저장.
-        FIX: _dirty가 False이면 불필요한 I/O를 건너뜀.
-        """
-        if not self._conn_address:
-            return
-        if not self._dirty:
+        if not self._conn_address or not self._dirty:
             return
         try:
             self._path(self._conn_address).write_text(
@@ -206,16 +305,13 @@ class ECCMemory:
         except Exception:
             pass
 
-    # ── 체크포인트 (Working + Episodic 휘발성 메모리 보존) ─────
+    def flush_if_dirty(self) -> None:
+        if self._dirty:
+            self.save()
+
+    # ── 체크포인트 (Working + Episodic) ───────────────────────
 
     def checkpoint_save(self) -> None:
-        """
-        Working Memory + Episodic Memory를 디스크에 체크포인트 저장.
-
-        SSH 단절 / 프로세스 종료 후 재시작 시 복원 가능하도록
-        매 turn 종료 후 loop.py에서 호출한다.
-        Semantic Memory와 별도 파일로 관리 (오염 방지).
-        """
         if not self._conn_address:
             return
         try:
@@ -230,12 +326,15 @@ class ECCMemory:
                 },
                 "episodic": [
                     {
-                        "ts":      e.ts,
-                        "tool":    e.tool,
-                        "summary": e.summary,
-                        "ok":      e.ok,
+                        "ts":         e.ts,
+                        "tool":       e.tool,
+                        "summary":    e.summary,
+                        "ok":         e.ok,
+                        "importance": e.importance,
+                        "caused_by":  e.caused_by,
+                        "turn":       e.turn,
                     }
-                    for e in self.episodic[-50:]  # 최근 50개만 보존
+                    for e in self.episodic[-50:]
                 ],
             }
             self._checkpoint_path(self._conn_address).write_text(
@@ -246,13 +345,6 @@ class ECCMemory:
             pass
 
     def checkpoint_load(self) -> bool:
-        """
-        체크포인트 파일에서 Working + Episodic Memory 복원.
-
-        Returns:
-          True  — 복원 성공 (이전 세션 컨텍스트 있음)
-          False — 체크포인트 없거나 로드 실패
-        """
         if not self._conn_address:
             return False
         path = self._checkpoint_path(self._conn_address)
@@ -260,7 +352,6 @@ class ECCMemory:
             return False
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-
             w = data.get("working", {})
             self.working.goal         = w.get("goal", "")
             self.working.current_step = w.get("current_step", "")
@@ -268,11 +359,11 @@ class ECCMemory:
             self.working.turn         = w.get("turn", 0)
             self.working.last_action  = w.get("last_action", "")
             self.working.last_result  = w.get("last_result", "")
-
             self.episodic = [
                 Episode(
-                    ts=e["ts"], tool=e["tool"],
-                    summary=e["summary"], ok=e["ok"],
+                    ts=e["ts"], tool=e["tool"], summary=e["summary"],
+                    ok=e["ok"], importance=e.get("importance", 0.5),
+                    caused_by=e.get("caused_by", ""), turn=e.get("turn", 0),
                 )
                 for e in data.get("episodic", [])
             ]
@@ -281,9 +372,6 @@ class ECCMemory:
             return False
 
     def checkpoint_clear(self) -> None:
-        """
-        체크포인트 삭제. done() 성공 시 호출 — 완료된 세션의 잔재 방지.
-        """
         if not self._conn_address:
             return
         try:
@@ -294,56 +382,94 @@ class ECCMemory:
             pass
 
     def checkpoint_exists(self) -> bool:
-        """체크포인트 파일 존재 여부."""
         if not self._conn_address:
             return False
         return self._checkpoint_path(self._conn_address).exists()
 
-    def flush_if_dirty(self) -> None:
-        """
-        중요 사실 발견 직후 즉시 보존이 필요한 경우 명시적으로 호출.
-        constraints, failed namespace 변경 시 권장.
-        """
-        if self._dirty:
-            self.save()
-
     # ── 기록 헬퍼 ──────────────────────────────────────────────
 
     def remember(self, namespace: str, key: str, value) -> None:
-        """
-        Semantic memory에 사실 기록.
-
-        FIX v2: 매 호출마다 디스크 write하지 않고 _dirty = True 표시.
-        constraints / failed namespace는 즉시 flush (데이터 손실 위험이 높음).
-        나머지는 배치 저장 (loop의 done() / 세션 종료 시).
-        """
         self.semantic.set(namespace, key, value)
         self._dirty = True
-        # 물리 제약과 실패 이력은 즉시 보존 — 세션 중단 시 재발견 비용이 크다
         if namespace in ("constraints", "failed"):
             self.flush_if_dirty()
 
     def record_episode(self, tool: str, result: str, ok: bool) -> None:
-        self.episodic.append(Episode.from_result(tool, result, ok))
+        """
+        에피소드 기록 (v4: 중요도 + 인과 체인).
+        """
+        ep = Episode.from_result(
+            tool=tool,
+            result_text=result,
+            ok=ok,
+            turn=self.working.turn,
+            caused_by=self._last_episode_id,
+        )
+        self.episodic.append(ep)
+        self._last_episode_id = ep.id()
         if len(self.episodic) > 100:
             self.episodic = self.episodic[-100:]
 
-    # ── 조회 헬퍼 ──────────────────────────────────────────────
+    # ── 검색 헬퍼 ──────────────────────────────────────────────
 
-    def to_system_context(self) -> str:
+    def retrieve_episodes(
+        self,
+        query:        str,
+        top_k:        int  = 5,
+        failed_only:  bool = False,
+    ) -> list[Episode]:
+        """
+        v4: Generative Agents 공식 기반 에피소드 검색.
+        recency × importance × relevance 조합으로 상위 k개 반환.
+        """
+        pool = [e for e in self.episodic if not failed_only or not e.ok]
+        if not pool:
+            return []
+        current_turn = self.working.turn
+        scored = sorted(
+            pool,
+            key=lambda e: e.retrieval_score(query, current_turn),
+            reverse=True,
+        )
+        return scored[:top_k]
+
+    def to_system_context(self, query: str = "") -> str:
+        """
+        v4: query 파라미터 추가.
+        query가 있으면 Semantic은 쿼리 관련 항목만, Episodic은 관련 실패만 주입.
+        query 없으면 기존 동작 (전체 dump).
+        """
         parts = []
+
         wm = self.working.to_context()
         if wm:
             parts.append(wm)
-        failed_eps = [e for e in self.episodic[-10:] if not e.ok][-3:]
-        if failed_eps:
-            ep_lines = ["[Recent failures]"]
-            for e in failed_eps:
-                ep_lines.append(f"  {e.tool}: {e.summary[:80]}")
-            parts.append("\n".join(ep_lines))
-        sm = self.semantic.to_prompt_context()
+
+        # Episodic: 쿼리 기반 검색 or fallback 최근 실패
+        if query and self.episodic:
+            relevant_fails = self.retrieve_episodes(query, top_k=3, failed_only=True)
+            if relevant_fails:
+                ep_lines = ["[Relevant failures]"]
+                for e in relevant_fails:
+                    caused = f" ← {e.caused_by[:30]}" if e.caused_by else ""
+                    ep_lines.append(f"  {e.tool}: {e.summary[:80]}{caused}")
+                parts.append("\n".join(ep_lines))
+        else:
+            failed_eps = [e for e in self.episodic[-10:] if not e.ok][-3:]
+            if failed_eps:
+                ep_lines = ["[Recent failures]"]
+                for e in failed_eps:
+                    ep_lines.append(f"  {e.tool}: {e.summary[:80]}")
+                parts.append("\n".join(ep_lines))
+
+        # Semantic: 쿼리 기반 필터 or 전체 dump
+        if query:
+            sm = self.semantic.query_relevant(query, top_k=6)
+        else:
+            sm = self.semantic.to_prompt_context()
         if sm:
             parts.append(sm)
+
         return "\n\n".join(parts)
 
     def get_persistent_facts(self) -> str:
@@ -360,15 +486,13 @@ class ECCMemory:
 
     def can_execute(self, task_hint: str) -> tuple[bool, str]:
         hint = task_hint.lower()
-        hw = self.semantic.hardware
-
+        hw   = self.semantic.hardware
         if "ros2" in hint and not hw.get("ros2_available"):
-            return False, "ROS2 not confirmed on board — run probe(target='sw') first"
+            return False, "ROS2 not confirmed — run probe(target='sw') first"
         if "serial" in hint and not hw.get("serial_ports"):
             return False, "No serial devices confirmed — run probe(target='hw') first"
         if "lidar" in hint and not hw.get("lidar_device"):
             return False, "No LiDAR confirmed — run probe(target='lidar') first"
-
         return True, ""
 
     def update_working(self, **kwargs) -> None:
@@ -376,7 +500,16 @@ class ECCMemory:
             if hasattr(self.working, key):
                 setattr(self.working, key, value)
 
-    # ── typed semantic remember helpers ───────────────────────────
+    # ── SSH 프로파일 캐싱 헬퍼 (v4) ──────────────────────────
+
+    def get_ssh_profile(self) -> "dict | None":
+        """
+        이전에 성공한 SSH 연결 정보 반환.
+        BoardDiscovery.from_hint()에서 먼저 시도하면 탐색 시간 절감.
+        """
+        return self.semantic.get("hardware", "ssh_profile")
+
+    # ── typed remember helpers ──────────────────────────────
 
     def remember_hardware(self, key: str, value) -> None:
         self.remember("hardware", key, value)

@@ -3,6 +3,7 @@ import os
 import sys
 import textwrap
 from .loop import AgentLoop
+from .goal_history import load_history, format_history
 
 def main():
     parser = argparse.ArgumentParser(
@@ -14,6 +15,7 @@ def main():
           python ecc.py "1m/s로 3초 주행"
           python ecc.py --host 192.168.1.100 "차량 주행"
           python ecc.py   # REPL 모드
+          python ecc.py --history  # 이전 작업 이력 조회
         """)
     )
     parser.add_argument("goal", nargs="?", default=None)
@@ -22,7 +24,16 @@ def main():
     parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--max-turns", type=int, default=100)
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--history", action="store_true", help="이전 goal 이력 출력")
     args = parser.parse_args()
+
+    # --history 플래그
+    if args.history:
+        entries = load_history(last_n=30)
+        print(f"\n{'─'*60}\n  📋 최근 goal 이력 ({len(entries)}개)\n{'─'*60}")
+        print(format_history(entries))
+        print()
+        return
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("❌ ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
@@ -45,7 +56,7 @@ def main():
     else:
         # REPL
         model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
-        print(f"\n{'═'*60}\n  🤖 ECC  [{model}]\n  goal 입력. /quit 종료\n{'═'*60}\n")
+        print(f"\n{'═'*60}\n  🤖 ECC  [{model}]\n  goal 입력. /quit 종료, /history 이력\n{'═'*60}\n")
         while True:
             try:
                 prompt = f"ecc[{len(agent._session_messages)}]> " if agent._session_messages else "ecc> "
@@ -63,6 +74,9 @@ def main():
                 agent._session_executor = None
                 agent._session_memory = None
                 print("  🆕 새 세션"); continue
+            if raw.lower() in ("/history", "/h"):
+                entries = load_history(last_n=20)
+                print(format_history(entries)); continue
             try:
                 agent.run(raw + hint, max_turns=args.max_turns)
             except KeyboardInterrupt:

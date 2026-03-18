@@ -1,31 +1,4 @@
-"""
-ecc_core/tracer.py
-
-경량 JSONL 에이전트 트레이서.
-OpenTelemetry GenAI 시맨틱 컨벤션 기반 설계 (2026 표준).
-
-각 이벤트를 ~/.ecc/traces/<timestamp>_<goal_slug>.jsonl 에 기록.
-외부 의존성 없음 — 표준 라이브러리만 사용.
-트레이싱 실패는 조용히 무시 (best-effort).
-
-이벤트 종류:
-  session_start  — 세션 시작
-  llm_call       — API 호출 (model, tokens, duration)
-  tool_use       — 도구 실행 (name, input, output, ok, duration)
-  reflection     — Reflexion 생성 (decision, text)
-  note           — 기타 시스템 이벤트 (compact, escalation 등)
-  session_end    — 세션 종료 (success, summary)
-
-분석 예시:
-  # 세션별 총 토큰 비용
-  jq 'select(.event=="llm_call") | .tokens_in + .tokens_out' trace.jsonl | paste -sd+ | bc
-
-  # 실패한 도구 목록
-  jq 'select(.event=="tool_use" and .ok==false) | .tool + ": " + .output' trace.jsonl
-
-  # Escalation 빈도
-  jq 'select(.event=="llm_call" and .escalated==true)' trace.jsonl | wc -l
-"""
+"""ecc_core/tracer.py - JSONL 에이전트 트레이서 + 세션 비용 모니터링 (v2)"""
 
 import json
 import re
@@ -33,100 +6,100 @@ import time
 import os
 from pathlib import Path
 
+_COST_PER_1M: dict[str, tuple[float, float]] = {
+    "sonnet": (3.0,  15.0),
+    "opus":   (15.0, 75.0),
+    "haiku":  (0.25, 1.25),
+}
+
+def _model_cost(model: str, tokens_in: int, tokens_out: int) -> float:
+    key = next((k for k in _COST_PER_1M if k in model.lower()), "sonnet")
+    cin, cout = _COST_PER_1M[key]
+    return (tokens_in * cin + tokens_out * cout) / 1_000_000
+
 
 class Tracer:
-    """
-    JSONL 기반 에이전트 트레이서.
-    enabled=False이면 모든 메서드가 no-op.
-    """
+    """JSONL 기반 에이전트 트레이서. enabled=False이면 모든 메서드가 no-op."""
 
     def __init__(self, goal: str, enabled: bool = True):
         self.enabled = enabled
         self._path: Path | None = None
+        self._session_tokens_in:  int   = 0
+        self._session_tokens_out: int   = 0
+        self._session_cost_usd:   float = 0.0
+        self._llm_calls:          int   = 0
+        self._escalated_calls:    int   = 0
 
         if not enabled:
             return
-
-        # ECC_TRACE=0 이면 비활성화
         if os.environ.get("ECC_TRACE", "1") == "0":
             self.enabled = False
             return
 
-        ts = int(time.time())
-        slug = re.sub(r"[^\w가-힣]", "_", goal[:28]).strip("_") or "session"
+        ts   = int(time.time())
+        slug = re.sub(r"[^\w\uAC00-\uD7A3]", "_", goal[:28]).strip("_") or "session"
         self._path = Path(f"~/.ecc/traces/{ts}_{slug}.jsonl").expanduser()
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._write({"event": "session_start", "goal": goal[:200],
+                     "ts": ts, "pid": os.getpid()})
 
+    def llm_call(self, model, tokens_in, tokens_out, duration_ms, escalated=False):
+        self._session_tokens_in  += tokens_in
+        self._session_tokens_out += tokens_out
+        self._session_cost_usd   += _model_cost(model, tokens_in, tokens_out)
+        self._llm_calls          += 1
+        if escalated:
+            self._escalated_calls += 1
         self._write({
-            "event": "session_start",
-            "goal": goal[:200],
-            "ts": ts,
-            "pid": os.getpid(),
-        })
-
-    # ── 이벤트 기록 메서드 ─────────────────────────────────────
-
-    def llm_call(
-        self,
-        model: str,
-        tokens_in: int,
-        tokens_out: int,
-        duration_ms: int,
-        escalated: bool = False,
-    ) -> None:
-        self._write({
-            "event": "llm_call",
-            "model": model,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
+            "event": "llm_call", "model": model,
+            "tokens_in": tokens_in, "tokens_out": tokens_out,
             "cost_tokens": tokens_in + tokens_out,
-            "duration_ms": duration_ms,
-            "escalated": escalated,
+            "duration_ms": duration_ms, "escalated": escalated,
             "ts": time.time(),
         })
 
-    def tool_use(
-        self,
-        name: str,
-        inp_summary: str,
-        out_summary: str,
-        ok: bool,
-        duration_ms: int = 0,
-    ) -> None:
+    def tool_use(self, name, inp_summary, out_summary, ok, duration_ms=0):
         self._write({
-            "event": "tool_use",
-            "tool": name,
-            "input": inp_summary[:200],
-            "output": out_summary[:200],
-            "ok": ok,
-            "duration_ms": duration_ms,
-            "ts": time.time(),
+            "event": "tool_use", "tool": name,
+            "input": inp_summary[:200], "output": out_summary[:200],
+            "ok": ok, "duration_ms": duration_ms, "ts": time.time(),
         })
 
-    def reflection(self, decision: str, text: str) -> None:
+    def reflection(self, decision, text):
+        self._write({"event": "reflection", "decision": decision,
+                     "text": text[:300], "ts": time.time()})
+
+    def note(self, message):
+        self._write({"event": "note", "message": message[:300], "ts": time.time()})
+
+    def session_end(self, success: bool, summary: str = "") -> dict:
+        stats = {
+            "tokens_in":       self._session_tokens_in,
+            "tokens_out":      self._session_tokens_out,
+            "tokens_total":    self._session_tokens_in + self._session_tokens_out,
+            "cost_usd":        round(self._session_cost_usd, 4),
+            "llm_calls":       self._llm_calls,
+            "escalated_calls": self._escalated_calls,
+        }
         self._write({
-            "event": "reflection",
-            "decision": decision,
-            "text": text[:300],
-            "ts": time.time(),
+            "event": "session_end", "success": success,
+            "summary": summary[:200], "ts": time.time(), **stats,
         })
+        if self._llm_calls > 0:
+            tok   = stats["tokens_total"]
+            cost  = stats["cost_usd"]
+            calls = stats["llm_calls"]
+            esc   = stats["escalated_calls"]
+            print(
+                f"\n  {'='*60}\n"
+                f"  세션 비용: {tok:,} tokens | ~${cost:.4f} USD"
+                f" | LLM {calls}회 (에스컬레이션 {esc}회)",
+                flush=True,
+            )
+        return stats
 
-    def note(self, message: str) -> None:
-        self._write({
-            "event": "note",
-            "message": message[:300],
-            "ts": time.time(),
-        })
-
-    def session_end(self, success: bool, summary: str = "") -> None:
-        self._write({
-            "event": "session_end",
-            "success": success,
-            "summary": summary[:200],
-            "ts": time.time(),
-        })
-
-    # ── 내부 ───────────────────────────────────────────────────
+    def get_token_totals(self) -> tuple[int, int]:
+        return self._session_tokens_in, self._session_tokens_out
 
     def _write(self, obj: dict) -> None:
         if not self.enabled or self._path is None:
@@ -135,4 +108,4 @@ class Tracer:
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(obj, ensure_ascii=False) + "\n")
         except Exception:
-            pass  # 트레이싱 실패는 조용히 무시
+            pass
