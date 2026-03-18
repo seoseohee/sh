@@ -92,6 +92,15 @@ class ToolExecutor:
         if is_dangerous(cmd):
             return "[blocked] 위험한 명령으로 판단되어 실행을 거부했습니다."
 
+        # ── 물리 안전 guard (Edge IoT 보안 논문 기반) ───────────────────
+        # constraints memory의 max_erpm / max_speed 등을 초과하는
+        # 명령을 사전 차단 — is_dangerous()의 소프트웨어 레이어 너머
+        # 하드웨어 손상 방지용 가드
+        safety_warn = self._physical_safety_check(cmd)
+        if safety_warn:
+            return f"[safety_blocked] {safety_warn}"
+        # ────────────────────────────────────────────────────────────────
+
         if background:
             task_id = _uuid_mod.uuid4().hex[:8]
             task = _BgTask(task_id=task_id, cmd=cmd)
@@ -277,9 +286,15 @@ class ToolExecutor:
 
         _print_tool("probe", f"[{target}]", "하드웨어/환경 탐지")
 
-        cmd = PROBE_COMMANDS.get(target)
+        # v3: probe_registry 우선 조회 (플러그인 포함), fallback으로 PROBE_COMMANDS
+        from .tools import probe_registry
+        cmd = probe_registry.get(target)
         if not cmd:
-            return f"[error] 알 수 없는 probe target: {target}"
+            from .tools import PROBE_COMMANDS
+            cmd = PROBE_COMMANDS.get(target)
+        if not cmd:
+            available = probe_registry.list_targets()
+            return f"[error] 알 수 없는 probe target: {target}. 사용 가능: {available}"
 
         timeout = 60 if target == "parallel_scan" else 45
         result = self.conn.run(cmd, timeout=timeout)
@@ -482,6 +497,73 @@ class ToolExecutor:
 
     def _subagent(self, inp: dict) -> str:
         return "[error] subagent must be handled by AgentLoop, not ToolExecutor"
+
+    # ─── 물리 안전 guard ───────────────────────────────────────
+
+    def _physical_safety_check(self, cmd: str) -> str:
+        """
+        constraints memory 기반 물리 안전 사전 검증.
+
+        Edge IoT 보안 논문(2026) 기반:
+        is_dangerous()가 소프트웨어 레벨 위험(rm -rf 등)을 막는다면,
+        이 메서드는 하드웨어 물리 제약을 초과하는 명령을 사전 차단한다.
+
+        반환값:
+          ""    — 안전 (통과)
+          str   — 위험 이유 (차단)
+        """
+        if self.memory is None:
+            return ""
+        constraints = self.memory.semantic.constraints
+        if not constraints:
+            return ""
+
+        cmd_lower = cmd.lower()
+
+        # ERPM 한계 검사 — VESC 모터 컨트롤러
+        max_erpm = constraints.get("max_erpm")
+        if max_erpm is not None:
+            for m in __import__("re").finditer(r"data[\"']?\s*[:=]\s*(\d+(?:\.\d+)?)", cmd):
+                try:
+                    val = float(m.group(1))
+                    if val > float(max_erpm):
+                        return (
+                            f"ERPM {val} > max_erpm {max_erpm} (constraints memory). "
+                            f"Use a value ≤ {max_erpm} to prevent motor damage."
+                        )
+                except ValueError:
+                    pass
+
+        # 속도 한계 검사 — ROS2 cmd_vel / AckermannDrive
+        max_speed = constraints.get("max_speed_ms") or constraints.get("max_speed")
+        if max_speed is not None:
+            for m in __import__("re").finditer(
+                r"(?:speed|linear\.x|velocity)\s*[\":]\s*(\d+(?:\.\d+)?)", cmd
+            ):
+                try:
+                    val = float(m.group(1))
+                    if val > float(max_speed):
+                        return (
+                            f"Speed {val} m/s > max_speed {max_speed} m/s (constraints memory). "
+                            f"Use a value ≤ {max_speed} m/s."
+                        )
+                except ValueError:
+                    pass
+
+        # 온도 한계 — 히터/액추에이터 제어
+        max_temp = constraints.get("max_temp_c")
+        if max_temp is not None:
+            for m in __import__("re").finditer(r"temp\w*\s*[=:]\s*(\d+(?:\.\d+)?)", cmd_lower):
+                try:
+                    val = float(m.group(1))
+                    if val > float(max_temp):
+                        return (
+                            f"Temperature {val}°C > max_temp {max_temp}°C (constraints memory)."
+                        )
+                except ValueError:
+                    pass
+
+        return ""
 
     # ─── ask_user ──────────────────────────────────────────────
     # FIX: 기존 코드에서 클래스 밖(_local_write 아래)에 잘못 정의되어

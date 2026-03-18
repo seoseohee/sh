@@ -5,12 +5,70 @@ Claude Code의 도구 체계를 임베디드용으로 재설계.
 
 변경 이력:
   v2 — remember 도구 추가 (Semantic Memory 영속 저장)
-       에이전트가 발견한 물리 제약/하드웨어 사실을 세션 간 보존.
+  v3 — ProbeRegistry / VerifyRegistry 추가 (SWE-Agent ACI 패턴)
+       새 보드 타입(Jetson, Pi5, STM32 등) 추가 시
+       ecc_core 코어를 건드리지 않고 런타임 등록 가능.
+       환경변수 ECC_PLUGIN_DIR로 외부 플러그인 디렉토리 지정 가능.
 """
 
 # ─────────────────────────────────────────────────────────────
-# 도구 스키마 정의
+# Probe / Verify 플러그인 레지스트리 (SWE-Agent ACI 패턴)
 # ─────────────────────────────────────────────────────────────
+
+class _Registry:
+    """런타임 등록 가능한 명령 레지스트리."""
+
+    def __init__(self, base: dict):
+        self._commands: dict[str, str] = dict(base)
+
+    def register(self, name: str, command: str, overwrite: bool = False) -> None:
+        """새 probe/verify 타겟을 등록한다.
+
+        예:
+          from ecc_core.tools import probe_registry
+          probe_registry.register("stm32", "st-info --probe && ...")
+        """
+        if name in self._commands and not overwrite:
+            raise ValueError(
+                f"'{name}' already registered. Use overwrite=True to replace."
+            )
+        self._commands[name] = command
+
+    def get(self, name: str) -> "str | None":
+        return self._commands.get(name)
+
+    def list_targets(self) -> list[str]:
+        return sorted(self._commands.keys())
+
+    def to_dict(self) -> dict:
+        return dict(self._commands)
+
+
+def _load_plugins(registry_type: str) -> dict:
+    """ECC_PLUGIN_DIR 환경변수에서 외부 플러그인 로드.
+
+    플러그인 파일 형식: Python 모듈에 PROBE_COMMANDS 또는 VERIFY_COMMANDS dict 정의.
+    """
+    import os, importlib.util, pathlib
+    plugin_dir = os.environ.get("ECC_PLUGIN_DIR", "")
+    if not plugin_dir:
+        return {}
+    result = {}
+    p = pathlib.Path(plugin_dir)
+    if not p.is_dir():
+        return {}
+    for f in p.glob("*.py"):
+        try:
+            spec = importlib.util.spec_from_file_location(f.stem, f)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            cmds = getattr(mod, registry_type, {})
+            if isinstance(cmds, dict):
+                result.update(cmds)
+        except Exception:
+            pass
+    return result
+
 
 TOOL_DEFINITIONS = [
 
@@ -677,3 +735,19 @@ def get_tool_definitions() -> list:
     if os.environ.get("ECC_ASK_USER") == "1":
         tools.append(ASK_USER_TOOL)
     return tools
+
+
+# ─────────────────────────────────────────────────────────────
+# 레지스트리 인스턴스 (SWE-Agent ACI 패턴, v3)
+# ─────────────────────────────────────────────────────────────
+
+# 외부 플러그인 로드 후 레지스트리 초기화
+_probe_plugins  = _load_plugins("PROBE_COMMANDS")
+_verify_plugins = _load_plugins("VERIFY_COMMANDS")
+
+probe_registry  = _Registry({**PROBE_COMMANDS,  **_probe_plugins})
+verify_registry = _Registry({**VERIFY_COMMANDS, **_verify_plugins})
+
+# executor.py / loop.py는 이 레지스트리를 통해 명령을 조회한다.
+# 기존 PROBE_COMMANDS / VERIFY_COMMANDS dict도 하위 호환성을 위해 유지.
+
