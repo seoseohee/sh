@@ -6,6 +6,14 @@ Executes tool_use requests from the LLM as actual board commands.
 Changelog:
   v2 — Fixed _ask_user defined outside class (AttributeError)
        Added background task completion wait on done() (race condition fix)
+  v3 — [Fix 1] _physical_safety_check: 정규식 확장
+         - 기존: data["']: 패턴만 커버
+         - 수정: linear_x/velocity/speed/current/temperature 등 주요 필드명 포괄
+         - JSON/YAML/Python dict/ROS2 msg 등 다양한 포맷 대응
+       [Fix 4] _bg_tasks / _serial_sessions 공유 딕셔너리 스레드 안전성
+         - ThreadPoolExecutor 병렬 실행 중 딕셔너리 접근 경쟁 조건 수정
+         - _bg_tasks_lock / _serial_sessions_lock 추가
+         - 모든 접근부에 락 적용
 """
 
 import json
@@ -59,8 +67,13 @@ class ToolExecutor:
         self.memory = memory
         self.verbose = verbose
         self.is_finished = False
+
+        # [Fix 4] 공유 딕셔너리에 락 추가
         self._bg_tasks: dict[str, _BgTask] = {}
+        self._bg_tasks_lock = threading.Lock()
+
         self._serial_sessions: dict[str, dict] = {}
+        self._serial_sessions_lock = threading.Lock()
 
     def execute(self, tool_name: str, tool_input: dict) -> str:
         handler = getattr(self, f"_{tool_name}", None)
@@ -72,7 +85,8 @@ class ToolExecutor:
                     n[1:] for n in dir(self)
                     if n.startswith("_") and not n.startswith("__")
                     and callable(getattr(self, n))
-                    and n[1:] not in ("bg_tasks", "serial_sessions")
+                    and n[1:] not in ("bg_tasks", "serial_sessions",
+                                      "bg_tasks_lock", "serial_sessions_lock")
                 )
             )
         return handler(tool_input)
@@ -97,7 +111,10 @@ class ToolExecutor:
         if background:
             task_id = _uuid_mod.uuid4().hex[:8]
             task = _BgTask(task_id=task_id, cmd=cmd)
-            self._bg_tasks[task_id] = task
+
+            # [Fix 4] 락으로 딕셔너리 쓰기 보호
+            with self._bg_tasks_lock:
+                self._bg_tasks[task_id] = task
 
             def _run():
                 r = self.conn.run(cmd, timeout=timeout)
@@ -139,9 +156,14 @@ class ToolExecutor:
 
         _print_tool("bash_wait", f"task_id={task_id}", desc)
 
-        task = self._bg_tasks.get(task_id)
+        # [Fix 4] 읽기/삭제 모두 락으로 보호
+        with self._bg_tasks_lock:
+            task = self._bg_tasks.get(task_id)
+
         if task is None:
-            return f"[error] task_id '{task_id}' not found. Valid IDs: {list(self._bg_tasks.keys())}"
+            with self._bg_tasks_lock:
+                valid_ids = list(self._bg_tasks.keys())
+            return f"[error] task_id '{task_id}' not found. Valid IDs: {valid_ids}"
 
         finished = task.wait(timeout=wait_timeout)
         if not finished:
@@ -151,7 +173,8 @@ class ToolExecutor:
             )
 
         result = task.result
-        del self._bg_tasks[task_id]
+        with self._bg_tasks_lock:
+            self._bg_tasks.pop(task_id, None)
         _print_result(result)
         return result.to_tool_result()
 
@@ -281,8 +304,6 @@ class ToolExecutor:
         from .tools import probe_registry
         cmd = probe_registry.get(target)
         if not cmd:
-            # probe_registry는 PROBE_COMMANDS + 플러그인을 이미 병합해서 초기화된다.
-            # 따라서 여기서 None이면 PROBE_COMMANDS를 다시 조회해도 동일하게 None이다.
             available = probe_registry.list_targets()
             return f"[error] Unknown probe target: {target}. Available: {available}"
 
@@ -302,13 +323,6 @@ class ToolExecutor:
         _print_tool("serial_open", f"{port} @ {baudrate}", desc)
 
         session_id = _uuid_mod.uuid4().hex[:8]
-        self._serial_sessions[session_id] = {
-            "port":     port,
-            "baudrate": baudrate,
-            "timeout":  timeout,
-            "desc":     desc,
-            "history":  [],
-        }
 
         check = self.conn.run(
             f"python3 -c \""
@@ -317,7 +331,6 @@ class ToolExecutor:
             timeout=10
         )
         if not check.ok:
-            del self._serial_sessions[session_id]
             _print_result(check)
             return (
                 f"[serial_open failed] {port} @ {baudrate}\n"
@@ -327,6 +340,16 @@ class ToolExecutor:
                 "- Check permissions: bash('ls -la /dev/ttyACM* /dev/ttyUSB*')\n"
                 "- Install pyserial: bash('pip3 install pyserial --break-system-packages')"
             )
+
+        # [Fix 4] 락으로 딕셔너리 쓰기 보호
+        with self._serial_sessions_lock:
+            self._serial_sessions[session_id] = {
+                "port":     port,
+                "baudrate": baudrate,
+                "timeout":  timeout,
+                "desc":     desc,
+                "history":  [],
+            }
 
         print(f"    serial session_id={session_id}  ({port} @ {baudrate})", flush=True)
         return (
@@ -346,11 +369,16 @@ class ToolExecutor:
 
         _print_tool("serial_send", f"session={session_id}", f"data={data[:40]!r}")
 
-        sess = self._serial_sessions.get(session_id)
+        # [Fix 4] 읽기도 락으로 보호 (스냅샷 복사)
+        with self._serial_sessions_lock:
+            sess = self._serial_sessions.get(session_id)
+
         if not sess:
+            with self._serial_sessions_lock:
+                valid = list(self._serial_sessions.keys())
             return (
                 f"[error] session_id '{session_id}' not found.\n"
-                f"Valid sessions: {list(self._serial_sessions.keys())}\n"
+                f"Valid sessions: {valid}\n"
                 "Call serial_open first."
             )
 
@@ -396,9 +424,14 @@ class ToolExecutor:
         _print_result(result)
 
         out = result.output()
-        sess["history"].append({"tx": data, "rx": out, "hex": hex_encode})
-        if len(sess["history"]) > 50:
-            sess["history"].pop(0)
+        # [Fix 4] history 업데이트도 락 보호
+        with self._serial_sessions_lock:
+            if session_id in self._serial_sessions:
+                self._serial_sessions[session_id]["history"].append(
+                    {"tx": data, "rx": out, "hex": hex_encode}
+                )
+                if len(self._serial_sessions[session_id]["history"]) > 50:
+                    self._serial_sessions[session_id]["history"].pop(0)
 
         return result.to_tool_result()
 
@@ -408,17 +441,19 @@ class ToolExecutor:
         session_id = inp.get("session_id", "")
 
         if not session_id:
-            n = len(self._serial_sessions)
-            self._serial_sessions.clear()
+            with self._serial_sessions_lock:
+                n = len(self._serial_sessions)
+                self._serial_sessions.clear()
             _print_tool("serial_close", "all", f"closing {n} sessions")
             return f"[serial_close] {n} sessions closed."
 
         _print_tool("serial_close", f"session={session_id}")
 
-        if session_id not in self._serial_sessions:
-            return f"[error] session_id '{session_id}' not found."
+        with self._serial_sessions_lock:
+            if session_id not in self._serial_sessions:
+                return f"[error] session_id '{session_id}' not found."
+            sess = self._serial_sessions.pop(session_id)
 
-        sess = self._serial_sessions.pop(session_id)
         history_count = len(sess["history"])
         print(f"    Closed {sess['port']} (io count: {history_count})", flush=True)
         return (
@@ -490,51 +525,106 @@ class ToolExecutor:
 
     # ─── physical safety guard ─────────────────────────────────
 
+    # [Fix 1] 수치 추출 패턴 확장
+    #   기존: data["']: 표기만 커버
+    #   수정: ROS2 msg / JSON / YAML / Python dict / 직접 할당 등 포괄
+    #
+    # 커버 예시:
+    #   data: 5000                          (YAML/ROS2 Int32 msg)
+    #   data=5000                           (Python/shell)
+    #   linear_x: 5000 / linear.x: 5000    (geometry_msgs flattened)
+    #   velocity: 5000.0 / speed=5.0        (generic)
+    #   "speed": 5000                       (JSON)
+    #   {linear: {x: 3.0}}                 (ROS2 Twist nested YAML)
+    #   current: 5.0 / temperature=90       (전류/온도)
+    _SPEED_FIELDS   = r"(?:linear[._]x|linear\s*:\s*\{[^}]*x|velocity|speed|vx|v_x)"
+    _ERPM_FIELDS    = r"(?:data|erpm|rpm|duty)"
+    _CURRENT_FIELDS = r"(?:current|amps?|amperage)"
+    _TEMP_FIELDS    = r"(?:temp(?:erature)?|thermal)"
+    # 수치 값 패턴: key: val  /  key=val  /  key: {x: val}  (nested YAML)
+    # {0,20} 한정으로 greedy 방지, 마지막 수치 캡처
+    _VAL_PATTERN    = r"""[\"']?\s*[:=]\s*\{?[^}]{0,20}?(-?\d+(?:\.\d+)?)"""
+
     def _physical_safety_check(self, cmd: str) -> str:
         """
         Pre-execution physical constraint validation based on constraints memory.
 
+        [Fix 1] 정규식 확장:
+          - 기존 data[":] 한 가지 패턴 → 필드명별 패턴 그룹으로 분리
+          - ERPM / 속도 / 전류 / 온도 각각 독립 체크
+          - 음수 값도 포괄 (-5000 ERPM 등)
+
         Returns "" if safe, or a reason string if blocked.
         """
+        import re
         if self.memory is None:
             return ""
         constraints = self.memory.semantic.constraints
         if not constraints:
             return ""
 
-        cmd_lower = cmd.lower()
-
+        # ── ERPM 상한 ─────────────────────────────────────────
         max_erpm = constraints.get("max_erpm")
         if max_erpm is not None:
-            for m in __import__("re").finditer(r"data[\"']?\s*[:=]\s*(\d+(?:\.\d+)?)", cmd):
+            pattern = re.compile(
+                self._ERPM_FIELDS + self._VAL_PATTERN,
+                re.IGNORECASE,
+            )
+            for m in pattern.finditer(cmd):
                 try:
                     val = float(m.group(1))
-                    if val > float(max_erpm):
+                    if abs(val) > float(max_erpm):
                         return (
-                            f"ERPM {val} > max_erpm {max_erpm} (constraints memory). "
-                            f"Use a value <= {max_erpm} to prevent motor damage."
+                            f"ERPM |{val}| > max_erpm {max_erpm} (constraints memory). "
+                            f"Use a value with absolute value <= {max_erpm} to prevent motor damage."
                         )
                 except ValueError:
                     pass
 
+        # ── 속도 상한 ─────────────────────────────────────────
         max_speed = constraints.get("max_speed_ms") or constraints.get("max_speed")
         if max_speed is not None:
-            for m in __import__("re").finditer(
-                r"(?:speed|linear\.x|velocity)\s*[\":]\s*(\d+(?:\.\d+)?)", cmd
-            ):
+            pattern = re.compile(
+                self._SPEED_FIELDS + self._VAL_PATTERN,
+                re.IGNORECASE,
+            )
+            for m in pattern.finditer(cmd):
                 try:
                     val = float(m.group(1))
-                    if val > float(max_speed):
+                    if abs(val) > float(max_speed):
                         return (
-                            f"Speed {val} m/s > max_speed {max_speed} m/s (constraints memory). "
-                            f"Use a value <= {max_speed} m/s."
+                            f"Speed |{val}| m/s > max_speed {max_speed} m/s (constraints memory). "
+                            f"Use a value with absolute value <= {max_speed} m/s."
                         )
                 except ValueError:
                     pass
 
+        # ── 전류 상한 (선택적 제약) ───────────────────────────
+        max_current = constraints.get("max_current_a") or constraints.get("max_current")
+        if max_current is not None:
+            pattern = re.compile(
+                self._CURRENT_FIELDS + self._VAL_PATTERN,
+                re.IGNORECASE,
+            )
+            for m in pattern.finditer(cmd):
+                try:
+                    val = float(m.group(1))
+                    if abs(val) > float(max_current):
+                        return (
+                            f"Current |{val}|A > max_current {max_current}A (constraints memory). "
+                            f"Use a value with absolute value <= {max_current}A."
+                        )
+                except ValueError:
+                    pass
+
+        # ── 온도 상한 ─────────────────────────────────────────
         max_temp = constraints.get("max_temp_c")
         if max_temp is not None:
-            for m in __import__("re").finditer(r"temp\w*\s*[=:]\s*(\d+(?:\.\d+)?)", cmd_lower):
+            pattern = re.compile(
+                self._TEMP_FIELDS + self._VAL_PATTERN,
+                re.IGNORECASE,
+            )
+            for m in pattern.finditer(cmd):
                 try:
                     val = float(m.group(1))
                     if val > float(max_temp):
@@ -575,17 +665,20 @@ class ToolExecutor:
         evidence = inp.get("evidence", "")
         notes = inp.get("notes", "")
 
-        running = [tid for tid, t in self._bg_tasks.items() if not t.done]
+        with self._bg_tasks_lock:
+            running = [tid for tid, t in self._bg_tasks.items() if not t.done]
         if running:
             print(
                 f"\n  Warning: done() called with background tasks still running: {running}",
                 flush=True
             )
 
-        if self._serial_sessions:
-            n = len(self._serial_sessions)
-            print(f"\n  Auto-closing {n} open serial session(s)...", flush=True)
-            self._serial_sessions.clear()
+        with self._serial_sessions_lock:
+            n_serial = len(self._serial_sessions)
+        if n_serial:
+            print(f"\n  Auto-closing {n_serial} open serial session(s)...", flush=True)
+            with self._serial_sessions_lock:
+                self._serial_sessions.clear()
 
         icon = "OK" if success else "FAIL"
         print(f"\n{'='*60}")

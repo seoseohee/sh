@@ -5,6 +5,12 @@ Tool execution responsibilities separated from AgentLoop:
   - ssh_connect handling
   - subagent routing (SubagentRole)
   - _handle_ssh_connect, _check_connection
+
+Changelog:
+  v2 — [Fix 2] run_subagent 절대 상한선 추가
+         기존: max_turns += 20 반복으로 이론상 무한 실행 가능
+         수정: ECC_SUBAGENT_MAX_TURNS_ABSOLUTE (default: 200)로 절대 상한 적용
+               초과 시 즉시 "(subagent: hard turn limit)" 반환
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -111,6 +117,11 @@ def run_subagent(
     executor      = ToolExecutor(conn, todos, memory=memory, verbose=verbose)
     messages      = [{"role": "user", "content": goal}]
     max_turns     = _env_int("ECC_SUBAGENT_TURNS", 40)
+
+    # [Fix 2] 절대 상한선: max_turns += 20 무한 반복 방지
+    # 개별 확장은 허용하되, 이 값을 초과하면 즉시 중단
+    hard_limit    = _env_int("ECC_SUBAGENT_MAX_TURNS_ABSOLUTE", 200)
+
     turn          = 0
 
     PARALLEL = {
@@ -119,6 +130,15 @@ def run_subagent(
     }
 
     while True:
+        # [Fix 2] 절대 상한 체크 — max_turns 확장 여부와 무관하게 강제 종료
+        if turn >= hard_limit:
+            print(
+                f"\n  ⚠️  subagent hard turn limit reached ({hard_limit}). "
+                "Forcing return without report.",
+                flush=True,
+            )
+            return f"(subagent: hard turn limit {hard_limit} reached — no report)"
+
         resp = client.messages.create(
             model=_main_model(), max_tokens=_env_int("ECC_SUBAGENT_MAX_TOKENS", 4096),
             system=system, tools=tools, messages=messages,
@@ -170,6 +190,7 @@ def run_subagent(
         turn += 1
         if turn >= max_turns:
             messages.append({"role": "user", "content": f"[system] {turn} turns. Call report() now."})
+            # [Fix 2] 확장은 허용하되 hard_limit이 최종 방어선
             max_turns += 20
 
     return "(subagent: no report)"
@@ -287,7 +308,6 @@ class ToolDispatcher:
         print(f"\n  🔗 ssh_connect: host={host} user={user or 'auto'} port={port}", flush=True)
 
         if host.lower() == "scan" or not host:
-            # v4: Try SSH profile cache first (reduce discovery time)
             loop = self._loop
             if hasattr(loop, '_session') and loop._session._saved_memory:
                 profile = loop._session._saved_memory.get_ssh_profile()
@@ -329,11 +349,8 @@ class ToolDispatcher:
     def check_connection(self, messages: list[dict]) -> None:
         if not self.conn:
             return
-        # 저렴한 플래그 체크 먼저 — likely_disconnected가 False이면
-        # SSH 핑 없이 즉시 반환한다 (10턴마다 불필요한 왕복 방지).
         if not self.conn.likely_disconnected:
             return
-        # 연속 실패 징후(3회 이상)가 있을 때만 실제 SSH 핑으로 확인.
         if self.conn.is_alive():
             self.conn._consecutive_failures = 0
             return
