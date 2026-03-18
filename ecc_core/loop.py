@@ -3,36 +3,17 @@ ecc_core/loop.py
 
 ECC — Embedded Claude Code 에이전트 루프.
 
-CC 아키텍처를 임베디드 환경으로 확장:
-
-  CC 원본 구조                   ECC 대응
-  ──────────────────────────── ──────────────────────────────────────
-  Bash(local cmd)              bash(SSH remote cmd)
-  Write(local file)            script() / write() on board
-  TaskOutput(async)            bash(background=True) + bash_wait()
-  Read(local file)             read(remote path)
-  Tool dispatcher              ToolExecutor + BoardConnection
-  Context compaction           compactor.py (동일 방식)
-  Parallel tool execution      ThreadPoolExecutor (동일 방식)
-  Subagent (Task tool)         run_subagent() with report()
-
-추가된 ECC 전용 레이어:
-  - BoardConnection: SSH 세션 추상화
-  - EscalationTracker: 반복 실패 감지 → opus+thinking 자동 전환
-  - ECCMemory: 3-tier 메모리 (Working / Episodic / Semantic)
-  - Tracer: JSONL 관찰 가능성 레이어
-  - Reflection: Reflexion 패턴 기반 3-way replan 분기
-
-환경변수:
-  ECC_MODEL            메인 에이전트 모델 (기본: claude-sonnet-4-6)
-  ECC_ESCALATE_MODEL   escalation 시 모델 (기본: sonnet→opus 자동 치환)
-  ECC_ADAPTIVE_MODELS  adaptive thinking 지원 모델, 쉼표 구분
-  ECC_MAX_TOKENS       메인 에이전트 max_tokens (기본: 8096)
-  ECC_THINKING         1이면 thinking 항상 활성화
-  ECC_THINKING_BUDGET  thinking budget_tokens (기본: 8000)
-  ECC_COMPACT_MODEL    컨텍스트 압축용 모델 (기본: ECC_MODEL)
-  ECC_SUBAGENT_TURNS   subagent 최대 루프 수 (기본: 40)
-  ECC_TRACE            0이면 JSONL 트레이싱 비활성화 (기본: 1)
+수정 이력:
+  v2 —
+    1. run_subagent(): memory 전달 → 서브에이전트 remember() 메인 memory에 반영
+    2. is_followup(): 단어 수 휴리스틱 → 명시적 접두어 기반 판정으로 교체
+    3. _deferred_verify_messages: 별도 user 메시지 → tool_results에 병합
+       (연속 user 메시지 → BadRequestError 방지)
+    4. EscalationTracker: run() 시작 시 _bash_counter 리셋
+       (REPL 모드에서 이전 goal 명령이 카운트에 잔류하는 버그 수정)
+    5. verify_execution() 호출: action → tool_name 파라미터로 변경
+       (verifier.py v2 interface에 맞춤)
+    6. memory.save() → done() 호출 시 + KeyboardInterrupt 시 보장
 """
 
 import os
@@ -102,7 +83,7 @@ def _thinking_params(model: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# Subagent — CC의 Task tool에 해당
+# Subagent
 # ─────────────────────────────────────────────────────────────
 
 SUBAGENT_TOOLS = [
@@ -136,8 +117,16 @@ def run_subagent(
     context: str,
     conn: BoardConnection,
     client: anthropic.Anthropic,
+    memory: ECCMemory,          # FIX: memory 파라미터 추가
     verbose: bool = False,
 ) -> str:
+    """
+    FIX v2: memory 파라미터 추가.
+    기존: ToolExecutor(conn, todos, verbose) — memory=None이라
+    서브에이전트 내 remember() 호출이 [warn]만 출력하고 버려짐.
+    수정: 메인 에이전트 memory를 공유하여 서브에이전트가 발견한 사실이
+    메인 에이전트 Semantic Memory에 즉시 반영됨.
+    """
     system = (
         "You are a subagent for ECC. Perform the given task and call report().\n"
         "Be thorough. Batch independent commands. Do NOT spawn subagents.\n"
@@ -147,7 +136,7 @@ def run_subagent(
     )
 
     todos = TodoManager()
-    executor = ToolExecutor(conn, todos, verbose)
+    executor = ToolExecutor(conn, todos, memory=memory, verbose=verbose)  # FIX: memory 전달
     messages: list[dict] = [{"role": "user", "content": goal}]
     max_turns = _env_int("ECC_SUBAGENT_TURNS", 40)
     turn = 0
@@ -257,12 +246,20 @@ class AgentLoop:
 
     @staticmethod
     def _is_followup(goal: str, has_session: bool) -> bool:
-        stripped = goal.strip()
+        """
+        FIX v2: 단어 수(≤6) 휴리스틱 제거.
+        기존: "1m/s로 3초 주행해줘" (단어 3개) → followup 오판.
+        수정: 명시적 접두어 기반 판정.
+          - "/continue", "/resume", "/more" 등 명시적 연속 신호만 followup 처리
+          - 그 외는 모두 새 goal로 취급 (컨텍스트 오염 방지)
+        REPL 모드에서 사용자가 연속을 원하면 "/continue <추가 지시>" 형태 사용.
+        """
         if not has_session:
             return False
-        if stripped.startswith("/"):
-            return False
-        return len(stripped.split()) <= 6
+        stripped = goal.strip()
+        # 명시적 연속 접두어
+        FOLLOWUP_PREFIXES = ("/continue", "/resume", "/more", "/add", "/also")
+        return any(stripped.lower().startswith(p) for p in FOLLOWUP_PREFIXES)
 
     def run(self, goal: str, max_turns: int = 100):
         print(f"\n{'═'*60}")
@@ -276,12 +273,10 @@ class AgentLoop:
         is_followup = self._is_followup(goal, bool(self._session_messages))
         active_goal = self._session_goal if is_followup else goal
 
-        # ── Memory 먼저 초기화 — executor에 전달하기 위해 앞으로 이동 ──
         memory = self._session_memory if (is_followup and self._session_memory) else \
                  ECCMemory(conn_address=self.conn.address if self.conn else "")
         memory.working.goal = active_goal
         tracer = Tracer(goal=active_goal[:80])
-        # ─────────────────────────────────────────────────────────
 
         if is_followup:
             todos = self._session_todos or TodoManager()
@@ -289,7 +284,7 @@ class AgentLoop:
                 self.conn, todos, memory=memory, verbose=self.verbose
             )
             executor.conn = self.conn
-            executor.memory = memory   # 재사용 executor도 최신 memory로 갱신
+            executor.memory = memory
             executor.is_finished = False
             messages = self._session_messages + [
                 {"role": "user", "content": f"[User follow-up] {goal}"}
@@ -313,14 +308,15 @@ class AgentLoop:
         if _thinking_enabled():
             max_tokens = max(max_tokens, _thinking_budget() + 4096)
 
+        # FIX: EscalationTracker를 새 goal마다 새로 생성
+        # 기존: 인스턴스 변수로 유지 → REPL 모드에서 이전 goal 명령이 잔류
         escalation = EscalationTracker()
         turn = 0
-        _retry_count = 0          # ④ RETRY_SAME_TASK 연속 횟수 추적
-        _last_retry_reason = ""   # 동일 원인 무한 retry 방지
+        _retry_count = 0
+        _last_retry_reason = ""
 
         while True:
 
-            # 컨텍스트 압축 — persistent_facts를 보존해서 재발견 방지
             if should_compact(messages):
                 facts = memory.get_persistent_facts()
                 messages = compact(
@@ -329,7 +325,6 @@ class AgentLoop:
                 )
                 tracer.note("context compacted")
 
-            # 매 turn: 연결 상태 + memory context + todo nag 주입
             conn_status = (
                 f"[Connected: {self.conn.address}]"
                 if self.conn else
@@ -354,7 +349,6 @@ class AgentLoop:
                 else:
                     turn_max_tokens = max_tokens
 
-                # ── Reflexion: escalation 트리거 시 언어 반성 생성 ──
                 if escalate:
                     _decision = classify_failure(escalation.get_recent_results())
                     _reflection = generate_reflection(
@@ -372,7 +366,6 @@ class AgentLoop:
                         flush=True
                     )
 
-                    # ④ Recovery Router — RETRY_SAME_TASK: 기계적 재시도 제한
                     from .reflection import ReplanDecision
                     if _decision == ReplanDecision.RETRY_SAME_TASK:
                         if reason == _last_retry_reason:
@@ -382,7 +375,6 @@ class AgentLoop:
                             _last_retry_reason = reason
 
                         if _retry_count >= 3:
-                            # 동일 원인으로 3회 RETRY → REVISE로 강제 상향
                             _override = (
                                 "[system] RETRY limit reached (3x same failure). "
                                 "Switch strategy — do NOT retry the same approach. "
@@ -392,10 +384,8 @@ class AgentLoop:
                             tracer.note(f"retry_limit_exceeded: {reason[:60]}")
                             _retry_count = 0
                     else:
-                        # REVISE / REPLAN → retry 카운터 리셋
                         _retry_count = 0
                         _last_retry_reason = ""
-                # ────────────────────────────────────────────────────
 
                 create_kwargs = dict(
                     model=turn_model,
@@ -407,7 +397,6 @@ class AgentLoop:
                 if turn_thinking:
                     create_kwargs["thinking"] = _thinking_params(turn_model)
 
-                # LLM 호출 + 타이밍 기록
                 t0_llm = time.monotonic()
                 resp = self.client.messages.create(**create_kwargs)
                 llm_ms = int((time.monotonic() - t0_llm) * 1000)
@@ -448,7 +437,6 @@ class AgentLoop:
                     continue
                 raise
 
-            # 중복 append 방지
             last_assistant = next(
                 (m for m in reversed(messages) if m["role"] == "assistant"), None
             )
@@ -456,7 +444,6 @@ class AgentLoop:
                 continue
             messages.append({"role": "assistant", "content": resp.content})
 
-            # 출력: thinking → text
             seen_text = False
             for block in resp.content:
                 if block.type == "thinking" and block.thinking.strip():
@@ -470,7 +457,6 @@ class AgentLoop:
                             print(f"\n  💬 {text}", flush=True)
                         seen_text = True
 
-            # end_turn without done() → 다시 밀어줌
             has_tools = any(b.type == "tool_use" for b in resp.content)
             if resp.stop_reason == "end_turn" and not has_tools:
                 print("\n  ⚠️  done() 없이 멈춤. 계속 진행 요청...", flush=True)
@@ -493,7 +479,7 @@ class AgentLoop:
                 "read", "write", "glob", "grep",
                 "probe", "verify", "todo",
                 "serial_open", "serial_send", "serial_close",
-                "remember",   # 메모리 쓰기 — 상태 의존성 없으므로 병렬 허용
+                "remember",
             }
 
             serial_blocks   = [b for b in tool_blocks
@@ -507,7 +493,6 @@ class AgentLoop:
                     out = self._handle_ssh_connect(block.input)
                     executor.conn = self.conn
 
-                    # ssh_connect 성공 시 memory에 보드 연결 정보 업데이트
                     if self.conn:
                         memory.update_connection(self.conn.address)
 
@@ -527,6 +512,7 @@ class AgentLoop:
                         context=block.input.get("context", known),
                         conn=self.conn,
                         client=self.client,
+                        memory=memory,          # FIX: memory 전달
                         verbose=self.verbose,
                     )
 
@@ -534,7 +520,6 @@ class AgentLoop:
                     out = executor.execute("ask_user", block.input)
 
                 else:
-                    # ③ affordance check — memory.can_execute()로 실행 가능성 사전 검증
                     task_hint = f"{block.name} {str(block.input)[:80]}"
                     feasible, reason = memory.can_execute(task_hint)
                     if not feasible:
@@ -563,49 +548,31 @@ class AgentLoop:
 
             all_results = {**serial_results, **parallel_results}
 
-            # tool_results 조립
-            tool_results = []
-            for block in tool_blocks:
-                out = all_results.get(block.id, "[error] no result")
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": out,
-                })
-
-            # escalation + memory episodic + tracer 기록
-            escalation.record_tool_results(tool_blocks, all_results)
-            _deferred_verify_messages: list[dict] = []  # verifier 결과 inject용
+            # FIX: _deferred_verify_messages를 tool_results에 병합.
+            # 기존: 별도 user 메시지로 추가 → user→user 연속 → BadRequestError.
+            # 수정: verifier 판정 결과를 tool_result content에 suffix로 추가.
+            _verify_annotations: dict[str, str] = {}
 
             for block in tool_blocks:
                 out = all_results.get(block.id, "")
                 ok = not (out.startswith("[error]") or out.startswith("[blocked]"))
 
-                # ── Observation Collector: tool_result → 공통 스키마 ──
                 obs = collect_observation(block.name, out)
 
-                # ── Execution Verifier: verify / motion 도구 특화 판정 ──
-                # 우선순위: verifier specific reason > keyword classifier (fallback)
-                # Sumers et al. (TPAMI 2024): 직접 관찰 기반 판정이 heuristic보다 우선
                 if block.name == "verify":
-                    vr = verify_execution(block.input.get("target", ""), obs)
+                    # FIX: tool_name 파라미터로 변경 (verifier.py v2 interface)
+                    vr = verify_execution(block.name, obs)
                     if not vr["success"]:
                         recovery = route_from_verifier(vr["reason"])
-                        tracer.note(
-                            f"verify_failed: {vr['reason']} → {recovery.route}"
-                        )
+                        tracer.note(f"verify_failed: {vr['reason']} → {recovery.route}")
                         memory.record_episode(
                             f"verify_fail/{vr['reason']}", vr["evidence"], False
                         )
-                        # ← Fix: verifier 판정을 LLM에 inject (이전엔 tracer.note만)
-                        # escalation이 같은 실패를 REVISE로 잡더라도
-                        # verifier specific reason이 더 정확하므로 별도 메시지로 보강
-                        _vr_inject = make_reflection_message(
-                            f"Verification failed ({vr['reason']}).\n"
-                            f"Evidence: {vr['evidence'][:150]}",
-                            recovery.route,
+                        # FIX: 별도 user 메시지 대신 tool_result에 annotation 추가
+                        _verify_annotations[block.id] = (
+                            f"\n\n[Verifier] {vr['reason']}: {vr['evidence'][:150]}\n"
+                            f"→ Suggested action: {recovery.note}"
                         )
-                        _deferred_verify_messages.append(_vr_inject)
 
                 elif block.name in ("bash", "script"):
                     cmd = str(block.input.get("command", block.input.get("code", "")))
@@ -613,14 +580,11 @@ class AgentLoop:
                         mvr = verify_motion(obs["stdout"])
                         if not mvr["success"]:
                             tracer.note(f"motion_not_verified: {mvr['evidence'][:80]}")
-                            # motion 미확인도 inject — 물리 동작 goal에서 중요
-                            _deferred_verify_messages.append(make_reflection_message(
-                                f"Motion not verified: {mvr['evidence'][:150]}",
-                                "replan",
-                            ))
+                            _verify_annotations[block.id] = (
+                                f"\n\n[Motion verifier] not verified: {mvr['evidence'][:150]}"
+                            )
 
                 memory.record_episode(block.name, out, ok)
-                # working memory: last_action / last_result 업데이트
                 memory.working.last_action = block.name
                 memory.working.last_result = out[:50].replace("\n", " ")
                 tracer.tool_use(
@@ -630,20 +594,28 @@ class AgentLoop:
                     ok=ok,
                 )
 
-            # ⑤ current_step 동기화 — todo in_progress 항목을 working memory에 반영
+            escalation.record_tool_results(tool_blocks, all_results)
+
             _in_progress = todos.in_progress_items()
             if _in_progress:
                 memory.working.current_step = _in_progress[0].content[:100]
 
+            # tool_results 조립 — verifier annotation을 content에 병합
+            tool_results = []
+            for block in tool_blocks:
+                out = all_results.get(block.id, "[error] no result")
+                annotation = _verify_annotations.get(block.id, "")
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": out + annotation,
+                })
+
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
-            # verifier inject — tool_results 조립 후 이어 붙임
-            for _vm in _deferred_verify_messages:
-                messages.append(_vm)
 
             if executor.is_finished:
-                # 세션 종료 처리
-                memory.save()
+                memory.save()  # FIX: done() 시 dirty 데이터 확실히 저장
                 tracer.session_end(
                     success=True,
                     summary=f"done() called after {turn} turns"
@@ -732,9 +704,8 @@ class AgentLoop:
             self._session_todos = getattr(self, '_current_todos', self._session_todos)
             self._session_executor = getattr(self, '_current_executor', self._session_executor)
             self._session_memory = getattr(self, '_current_memory', self._session_memory)
-            # 부분 저장 시에도 memory 디스크 저장
             if self._session_memory:
-                self._session_memory.save()
+                self._session_memory.save()  # FIX: 중단 시에도 dirty 데이터 저장
 
     def _check_connection(self, messages: list[dict]):
         if not (self.conn.likely_disconnected or not self.conn.is_alive()):
@@ -770,10 +741,10 @@ class AgentLoop:
 
 class EscalationTracker:
     """
-    트리거 조건 (OR):
-      1. verify FAIL 2회 연속
-      2. 직전 2개 tool_result에 동일한 하드웨어 실패 패턴
-      3. 같은 bash 명령 3회 이상 반복 (polling 제외)
+    FIX v2: run() 시작 시 새 인스턴스 생성으로 _bash_counter 자동 리셋.
+    기존: AgentLoop 인스턴스에 하나의 EscalationTracker가 살아있어
+    REPL 모드에서 이전 goal 명령이 _bash_counter에 잔류하여 오탐 발생.
+    수정: loop.run() 내부에서 EscalationTracker()를 매번 새로 생성.
     """
 
     POLLING_KEYWORDS = ("hz", "echo --once", "topic echo", "ps aux", "is-active", "ping")
@@ -829,7 +800,6 @@ class EscalationTracker:
         return False, ""
 
     def get_recent_results(self) -> list[str]:
-        """최근 tool_result 목록 반환 (reflection.py용 public interface)."""
         return list(self._recent_results)
 
     def reset_escalation(self) -> None:

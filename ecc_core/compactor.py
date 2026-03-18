@@ -4,14 +4,22 @@ ecc_core/compactor.py
 환경변수:
   ECC_COMPACT_MODEL   압축용 모델 (기본: ECC_MODEL, 없으면 claude-sonnet-4-6)
   ECC_CONTEXT_LIMIT   컨텍스트 토큰 한계 (기본: 모델별 자동 설정)
+
+수정 이력:
+  v2 — 한국어 토큰 추정 오차 수정.
+       기존 chars // 4 는 영어 기준 (1 token ≈ 4 chars).
+       한국어는 1 token ≈ 1~2 chars 이므로 추정치가 실제의 절반 이하.
+       결과: 압축 트리거가 너무 늦게 발동 → BadRequestError.
+       수정: 문자 유형별 가중치를 적용하는 estimate_tokens() 함수.
 """
 
 import os
+import re
 import anthropic
 
 COMPACT_TRIGGER_RATIO = 0.85
 
-_DEFAULT_LIMIT = 180_000  # 실제 200k 중 안전 마진
+_DEFAULT_LIMIT = 180_000
 
 
 def _compact_model() -> str:
@@ -29,11 +37,43 @@ def _context_limit() -> int:
 
 
 def estimate_tokens(messages: list[dict]) -> int:
+    """
+    메시지 목록의 토큰 수를 추정.
+
+    FIX v2: 언어별 문자-토큰 비율 적용.
+      - ASCII (영어/코드): 4 chars ≈ 1 token
+      - 한국어/일본어/중국어: 1~2 chars ≈ 1 token → 2 chars per token 사용
+      - 그 외 유니코드: 3 chars ≈ 1 token (보수적 추정)
+
+    실제 API 토크나이저와 완전히 일치하지는 않지만
+    압축 트리거 판단에 충분한 근사치를 제공.
+    """
     total = 0
     for m in messages:
-        c = m.get("content", "")
-        total += len(str(c)) // 4
+        c = str(m.get("content", ""))
+        total += _count_tokens(c)
     return total
+
+
+def _count_tokens(text: str) -> int:
+    """문자열의 토큰 수 추정 (언어 혼용 대응)."""
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    # CJK Unified Ideographs + Hangul Syllables + Katakana + Hiragana
+    cjk_chars = sum(
+        1 for ch in text
+        if (0xAC00 <= ord(ch) <= 0xD7A3)   # 한글 완성형
+        or (0x1100 <= ord(ch) <= 0x11FF)   # 한글 자모
+        or (0x4E00 <= ord(ch) <= 0x9FFF)   # CJK 통합 한자
+        or (0x3040 <= ord(ch) <= 0x30FF)   # 히라가나/가타카나
+    )
+    other_chars = len(text) - ascii_chars - cjk_chars
+
+    tokens = (
+        ascii_chars // 4       # 영어/코드
+        + cjk_chars // 2       # 한/중/일
+        + other_chars // 3     # 기타 유니코드
+    )
+    return max(tokens, len(text) // 4)  # 하한: 기존 방식
 
 
 def should_compact(messages: list[dict]) -> bool:
@@ -52,7 +92,6 @@ def compact(
 
     persistent_facts: ECCMemory.get_persistent_facts() 결과.
     물리 제약, 하드웨어 사실 등 압축 후에도 반드시 보존해야 할 정보.
-    압축 요약 앞에 배치해서 에이전트가 재발견하지 않도록 한다.
     """
     print("\n  📦 컨텍스트 압축 중...", flush=True)
 
@@ -107,7 +146,6 @@ def compact(
     except Exception as e:
         summary = f"(컨텍스트 압축 중 오류: {e})"
 
-    # persistent_facts가 있으면 압축 후에도 맨 앞에 배치
     facts_section = (
         f"[Persistent facts — never rediscover these]\n{persistent_facts}\n\n"
         if persistent_facts.strip() else ""

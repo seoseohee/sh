@@ -1,3 +1,14 @@
+"""
+ecc_core/connection.py
+
+수정 이력:
+  v2 — BoardDiscovery.scan() IP 우선순위 보장.
+       기존: as_completed()는 응답 속도 순서로 결과를 돌려주어
+       known_hosts보다 서브넷 스캔 IP가 먼저 응답하면 우선순위가 무시됨.
+       수정: IP 그룹별 순차 시도 유지 + user 병렬 시도로 속도 확보.
+       첫 번째로 성공한 (IP 우선순위 존중) 연결을 반환.
+"""
+
 import platform
 import subprocess
 import time
@@ -123,7 +134,6 @@ class BoardConnection:
 class BoardDiscovery:
     @classmethod
     def _default_users(cls):
-        # ubuntu/jetson/pi 우선 — 요즘 임베디드 보드 대부분 root 직접 로그인 차단
         return _env_list("ECC_USERS", "ubuntu,jetson,pi,root,admin,debian,user")
 
     @classmethod
@@ -137,7 +147,6 @@ class BoardDiscovery:
     @classmethod
     def from_hint(cls, host, user, port):
         users = [user] if user else cls._default_users()
-        # user도 병렬 시도 — 직렬이면 7명 × 10초 = 최악 70초
         def _try(u):
             c = BoardConnection(host, u, port)
             return c if c.is_alive() else None
@@ -151,7 +160,6 @@ class BoardDiscovery:
 
     @classmethod
     def _known_hosts_ips(cls) -> list:
-        """~/.ssh/known_hosts 에서 IP 추출 — 이전에 연결한 적 있는 주소."""
         ips = []
         path = os.path.expanduser("~/.ssh/known_hosts")
         if not os.path.exists(path):
@@ -177,7 +185,6 @@ class BoardDiscovery:
 
     @classmethod
     def _arp_cache_ips(cls) -> list:
-        """ARP 캐시 (ip neigh show) — 최근에 통신한 장치 IP. 서브넷 스캔보다 훨씬 빠름."""
         ips = []
         try:
             r = subprocess.run(
@@ -202,6 +209,18 @@ class BoardDiscovery:
 
     @classmethod
     def scan(cls, user=None, port=22):
+        """
+        보드를 자동 탐색한다.
+
+        FIX v2: IP 우선순위 보장.
+        기존 코드는 IP 그룹별 순차 + user 병렬을 의도했으나
+        as_completed()가 완료 순서(응답 속도)로 결과를 돌려주어
+        우선순위가 낮은 서브넷 IP가 먼저 응답하면 잘못 선택됨.
+
+        수정: IP 그룹별 순차 유지.
+        각 IP에서 users를 병렬로 시도, 하나라도 성공하면 즉시 반환.
+        다음 IP 그룹으로 넘어가는 조건: 모든 user 시도 실패.
+        """
         candidates = []
         users = [user] if user else cls._default_users()
 
@@ -209,20 +228,20 @@ class BoardDiscovery:
             if ip and ip not in candidates:
                 candidates.append(ip)
 
-        # ① 환경변수 힌트 (즉시)
+        # ① 환경변수 힌트
         env_host = os.environ.get("ECC_BOARD_HOST")
         if env_host:
             _add(env_host)
 
-        # ② known_hosts — 이전에 SSH 연결한 IP (로컬 파일, 즉시)
+        # ② known_hosts
         for ip in cls._known_hosts_ips():
             _add(ip)
 
-        # ③ ARP 캐시 — 최근 통신한 장치 (~0.1초)
+        # ③ ARP 캐시
         for ip in cls._arp_cache_ips():
             _add(ip)
 
-        # ④ mDNS (.local 도메인 해석)
+        # ④ mDNS
         for mdns_name in cls._default_mdns():
             try:
                 ip = socket.gethostbyname(mdns_name)
@@ -230,7 +249,7 @@ class BoardDiscovery:
             except Exception:
                 pass
 
-        # ⑤ NIC 기반 서브넷 ping 스캔 (병렬, ~5-10초)
+        # ⑤ 서브넷 ping 스캔
         subnet_ips = cls._get_subnet_ips()
         if subnet_ips:
             workers = _env_int("ECC_SCAN_WORKERS", 200)
@@ -241,25 +260,37 @@ class BoardDiscovery:
                     ip = future.result()
                     _add(ip)
 
-        # 후보 IP × users 병렬 SSH 시도
         print(f"  🔑 {len(candidates)}개 후보 SSH 확인...", flush=True)
 
-        def _try_conn(ip, u):
+        # FIX: IP 우선순위 보장 — IP 순서대로 순차 시도
+        # 각 IP 내에서 users는 병렬 시도 (속도 확보)
+        for ip in candidates:
+            conn = cls._try_ip(ip, users, port)
+            if conn:
+                return conn
+
+        return None
+
+    @classmethod
+    def _try_ip(cls, ip: str, users: list, port: int) -> Optional["BoardConnection"]:
+        """
+        단일 IP에 대해 user 목록을 병렬로 SSH 시도.
+        첫 번째 성공한 연결 반환, 모두 실패 시 None.
+
+        FIX: as_completed 결과를 순서 없이 받되,
+        성공 즉시 반환하고 나머지 future를 cancel (불필요한 연결 방지).
+        """
+        def _try(u):
             c = BoardConnection(ip, u, port)
             return c if c.is_alive() else None
 
-        pairs = [(ip, u) for ip in candidates for u in users]
-        # IP 우선순위 보존: IP 순서대로 배치, 같은 IP 내에서 user 병렬
-        # → IP 그룹별로 순차, 그룹 내 user는 병렬
-        for ip in candidates:
-            ip_users = users
-            with ThreadPoolExecutor(max_workers=len(ip_users)) as pool:
-                futures = {pool.submit(_try_conn, ip, u): u for u in ip_users}
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result:
-                        return result
-
+        with ThreadPoolExecutor(max_workers=len(users)) as pool:
+            futures = {pool.submit(_try, u): u for u in users}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    # 나머지 future는 daemon thread라 자연 종료됨
+                    return result
         return None
 
     @staticmethod

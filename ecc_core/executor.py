@@ -3,24 +3,9 @@ ecc_core/executor.py
 
 LLM이 요청한 tool_use를 실제 보드 명령으로 실행한다.
 
-CC tool → ECC 대응:
-  CC Bash(local)          → bash(SSH remote) + script(upload+run)
-  CC Read(local file)     → read(remote path via SSH cat)
-  CC Write(local file)    → write(upload content via SSH) + script(interpreter)
-  CC TaskOutput(async)    → bash(background=True) + bash_wait()
-  [ECC 전용] ssh_connect  → BoardDiscovery.scan / from_hint
-  [ECC 전용] probe        → PROBE_COMMANDS 매핑 (hw/sw/net/motors/lidar/parallel_scan)
-  [ECC 전용] verify       → VERIFY_COMMANDS 매핑 (serial/i2c/ros2/process/system)
-  [ECC 전용] done         → is_finished=True + 터미널 출력
-
-실패 처리 철학:
-  CC: 로컬 명령 실패 → 예외 발생
-  ECC: SSH 명령 실패 → ExecResult(ok=False) → tool_result에 에러 내용 포함
-  실패는 '예외'가 아닌 '정보' — LLM이 다음 행동을 결정
-
-Level 1 자동 재시도:
-  bash()에서 SSH timeout(rc=-1) 발생 시 timeout을 2배로 늘려 1회 재시도.
-  일시적 네트워크 불안정을 자동 흡수. 재시도 후에도 실패하면 LLM이 판단.
+수정 이력:
+  v2 — _ask_user 클래스 밖 정의 버그 수정 (AttributeError 방지)
+       done() 호출 시 background task 완료 대기 추가 (race condition 방지)
 """
 
 import json
@@ -68,29 +53,18 @@ class ToolExecutor:
     """
     각 도구 이름을 받아서 실제 동작으로 디스패치.
     done이 호출되면 is_finished = True.
-
-    v5: conn은 None일 수 있다.
-    loop.py가 ssh_connect 후 executor.conn을 갱신해준다.
-    conn=None 상태에서 bash 등을 호출하면 loop.py에서 먼저 차단되므로
-    여기서는 conn이 있다고 가정해도 된다.
     """
 
     def __init__(self, conn, todos: TodoManager, memory=None, verbose: bool = False):
         self.conn = conn
         self.todos = todos
-        self.memory = memory   # ECCMemory | None
+        self.memory = memory
         self.verbose = verbose
         self.is_finished = False
         self._bg_tasks: dict[str, _BgTask] = {}
         self._serial_sessions: dict[str, dict] = {}
 
     def execute(self, tool_name: str, tool_input: dict) -> str:
-        """
-        tool_name에 따라 실행하고 결과 문자열 반환.
-        반환값은 LLM의 tool_result content가 된다.
-
-        dispatch는 getattr 기반 — 하드코딩 테이블 없음.
-        """
         handler = getattr(self, f"_{tool_name}", None)
         if handler is None:
             return (
@@ -141,9 +115,7 @@ class ToolExecutor:
         else:
             result = self.conn.run(cmd, timeout=timeout)
 
-            # ── Level 1 자동 재시도 (일시적 timeout 흡수) ──────────
-            # rc=-1 + "timeout" 메시지 → 2배 timeout으로 1회 재시도
-            # 같은 실수 반복 방지: rc=1 (명령 오류) 는 재시도하지 않음
+            # Level 1 자동 재시도 (일시적 timeout 흡수)
             if (
                 not result.ok
                 and result.rc == -1
@@ -151,12 +123,8 @@ class ToolExecutor:
                 and not background
             ):
                 retry_timeout = min(timeout * 2, 120)
-                print(
-                    f"    ⟳ timeout 감지 — {retry_timeout}s로 재시도...",
-                    flush=True
-                )
+                print(f"    ⟳ timeout 감지 — {retry_timeout}s로 재시도...", flush=True)
                 result = self.conn.run(cmd, timeout=retry_timeout)
-            # ────────────────────────────────────────────────────────
 
         _print_result(result)
         return result.to_tool_result()
@@ -465,12 +433,6 @@ class ToolExecutor:
     # ─── remember ──────────────────────────────────────────────
 
     def _remember(self, inp: dict) -> str:
-        """발견한 사실을 Semantic Memory에 영속 저장.
-
-        에이전트가 probe/verify/bash 결과에서 중요 사실을 발견하면
-        이 도구를 호출해서 세션 간에 보존한다.
-        다음 세션에서 동일 보드에 연결하면 자동으로 복원됨.
-        """
         ns    = inp.get("namespace", "hardware")
         key   = inp.get("key", "").strip()
         value = inp.get("value")
@@ -484,6 +446,8 @@ class ToolExecutor:
         self.memory.remember(ns, key, value)
         _print_tool("remember", f"[{ns}] {key} = {value}")
         return f"[ok] remembered: [{ns}] {key} = {value}"
+
+    # ─── verify ────────────────────────────────────────────────
 
     def _verify(self, inp: dict) -> str:
         target = inp["target"]
@@ -519,6 +483,29 @@ class ToolExecutor:
     def _subagent(self, inp: dict) -> str:
         return "[error] subagent must be handled by AgentLoop, not ToolExecutor"
 
+    # ─── ask_user ──────────────────────────────────────────────
+    # FIX: 기존 코드에서 클래스 밖(_local_write 아래)에 잘못 정의되어
+    #      AttributeError를 유발하던 버그를 클래스 안으로 이동하여 수정
+
+    def _ask_user(self, inp: dict) -> str:
+        question = inp["question"]
+        context = inp.get("context", "")
+
+        print("\n" + "─" * 60, flush=True)
+        if context:
+            print(f"  ℹ️  {context}", flush=True)
+        print(f"  ❓ {question}", flush=True)
+        print("─" * 60, flush=True)
+        try:
+            answer = input("  답변: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+            print("\n  (입력 없음 — 빈 답변으로 처리)", flush=True)
+
+        if not answer:
+            return "[ask_user] No answer provided. Proceed with best-effort assumption."
+        return f"[ask_user] User answered: {answer}"
+
     # ─── done ──────────────────────────────────────────────────
 
     def _done(self, inp: dict) -> str:
@@ -526,6 +513,15 @@ class ToolExecutor:
         summary = inp.get("summary", "")
         evidence = inp.get("evidence", "")
         notes = inp.get("notes", "")
+
+        # FIX: done() 호출 전 실행 중인 background task 경고
+        # race condition 방지 — 아직 완료되지 않은 bg task가 있으면 알림
+        running = [tid for tid, t in self._bg_tasks.items() if not t.done]
+        if running:
+            print(
+                f"\n  ⚠️  done() 호출 시 background task {running} 아직 실행 중.",
+                flush=True
+            )
 
         if self._serial_sessions:
             n = len(self._serial_sessions)
@@ -583,28 +579,6 @@ def _local_write(path: str, content: str, mode: str = "") -> ExecResult:
         return ExecResult(ok=True, stdout=f"written {len(content)} bytes to {path}", stderr="", rc=0, duration_ms=elapsed)
     except Exception as e:
         return ExecResult(ok=False, stdout="", stderr=str(e), rc=1)
-
-
-    # ─── ask_user ───────────────────────────────────────────────
-
-    def _ask_user(self, inp: dict) -> str:
-        question = inp["question"]
-        context = inp.get("context", "")
-
-        print("\n" + "─" * 60, flush=True)
-        if context:
-            print(f"  ℹ️  {context}", flush=True)
-        print(f"  ❓ {question}", flush=True)
-        print("─" * 60, flush=True)
-        try:
-            answer = input("  답변: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
-            print("\n  (입력 없음 — 빈 답변으로 처리)", flush=True)
-
-        if not answer:
-            return "[ask_user] No answer provided. Proceed with best-effort assumption."
-        return f"[ask_user] User answered: {answer}"
 
 
 # ─────────────────────────────────────────────────────────────

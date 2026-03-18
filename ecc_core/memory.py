@@ -3,17 +3,13 @@ ecc_core/memory.py
 
 ECCMemory — 3-tier memory architecture (Sumers et al., TPAMI 2024)
 
-  Working Memory  — 현재 실행 컨텍스트 (세션 내 빠른 읽기/쓰기)
-  Episodic Memory — 이번 세션의 시간순 사건 기록
-  Semantic Memory — 보드별 영속 지식 (세션 간 ~/.ecc/memory/ 에 보존)
-    .hardware    ← 디바이스 경로, ROS2 토픽, 환경 (Hardware Memory)
-    .protocol    ← baud rate, QoS, 통신 설정 (Protocol Memory)
-    .skill       ← 재사용 가능한 검증된 스크립트 (Skill Memory)
-    .constraints ← 물리 한계 (min_erpm, max_temp 등)
-    .failed      ← 실패한 접근법 (재시도 방지)
-
-BoardMemory.update_connection() 으로 보드별 영속 파일 로드.
-세션 간 재연결 후에도 하드웨어 사실/제약/실패 이력 유지.
+수정 이력:
+  v2 — dirty flag 기반 배치 저장.
+       기존: remember() 호출마다 전체 JSON 디스크 write → probe 결과 10개
+       저장 시 10회 I/O 발생.
+       수정: _dirty flag로 변경 여부 추적, save() 는 _dirty일 때만 write.
+       remember()는 즉시 디스크 저장 대신 dirty 표시 + flush_if_dirty() 제공.
+       loop.py의 done() 및 세션 종료 시점에 save() 호출.
 """
 
 import json
@@ -33,8 +29,8 @@ class WorkingMemory:
     current_step: str = ""
     conn_address: str = ""
     turn: int = 0
-    last_action: str = ""   # 직전 tool 이름
-    last_result: str = ""   # 직전 결과 요약 (50자)
+    last_action: str = ""
+    last_result: str = ""
 
     def to_context(self) -> str:
         parts = []
@@ -50,7 +46,7 @@ class WorkingMemory:
 
 
 # ─────────────────────────────────────────────────────────────
-# Episodic Memory — 시간순 사건 기록
+# Episodic Memory
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -71,19 +67,10 @@ class Episode:
 
 
 # ─────────────────────────────────────────────────────────────
-# Semantic Memory — namespace 기반 영속 지식 저장소
+# Semantic Memory
 # ─────────────────────────────────────────────────────────────
 
 class SemanticStore:
-    """
-    6개 memory 타입을 namespace로 통합:
-      hardware    ← Hardware Memory
-      protocol    ← Protocol Memory
-      skill       ← Skill Memory
-      constraints ← 물리 제약 (압축 후에도 반드시 보존)
-      failed      ← 실패 이력 (재시도 방지)
-    """
-
     NAMESPACES = ("hardware", "protocol", "skill", "constraints", "failed")
 
     def __init__(self, data: Optional[dict] = None):
@@ -106,10 +93,8 @@ class SemanticStore:
         return {k: dict(v) for k, v in self._d.items()}
 
     def to_prompt_context(self, max_items: int = 10) -> str:
-        """system 프롬프트에 주입할 요약. 압축 후에도 살아남는 핵심 정보."""
         lines = []
         count = 0
-        # constraints와 failed를 우선 표시
         for ns in ("constraints", "failed", "hardware", "protocol", "skill"):
             for k, v in list(self._d.get(ns, {}).items())[:3]:
                 if count >= max_items:
@@ -120,7 +105,6 @@ class SemanticStore:
             return ""
         return "[Board memory — do not rediscover]\n" + "\n".join(lines)
 
-    # 편의 프로퍼티
     @property
     def hardware(self) -> dict:
         return self._d["hardware"]
@@ -143,16 +127,18 @@ class SemanticStore:
 
 
 # ─────────────────────────────────────────────────────────────
-# ECCMemory — 3 tier 컨테이너
+# ECCMemory
 # ─────────────────────────────────────────────────────────────
 
 class ECCMemory:
     """
-    Layer C 아키텍처의 핵심 상태 컨테이너.
+    3-tier 메모리 컨테이너.
 
-    - Working: 현재 turn 컨텍스트
-    - Episodic: 이번 세션 사건 기록
-    - Semantic: 보드별 영속 지식 (~/.ecc/memory/<board>.json)
+    FIX v2: dirty flag 기반 배치 저장.
+    - remember() 는 메모리에만 쓰고 _dirty = True 로 표시.
+    - save() 는 _dirty 일 때만 디스크 write.
+    - flush_if_dirty() 는 선택적 중간 저장용 (중요 사실 발견 후 즉시 보존).
+    - 루프에서 done() 호출 시 및 KeyboardInterrupt 시 save() 호출.
     """
 
     def __init__(self, conn_address: str = ""):
@@ -160,6 +146,7 @@ class ECCMemory:
         self.episodic: list[Episode] = []
         self.semantic = SemanticStore()
         self._conn_address = ""
+        self._dirty = False
 
         if conn_address:
             self.update_connection(conn_address)
@@ -167,12 +154,15 @@ class ECCMemory:
     # ── 연결 갱신 ──────────────────────────────────────────────
 
     def update_connection(self, conn_address: str) -> None:
-        """SSH 연결 후 호출. 보드별 영속 메모리 로드."""
         if self._conn_address == conn_address:
             return
+        # 연결 변경 전 현재 dirty 데이터 저장
+        if self._dirty and self._conn_address:
+            self.save()
         self._conn_address = conn_address
         self.working.conn_address = conn_address
         self._load(conn_address)
+        self._dirty = False
 
     # ── 영속 저장/로드 ─────────────────────────────────────────
 
@@ -192,26 +182,48 @@ class ECCMemory:
                 pass
 
     def save(self) -> None:
-        """Semantic memory를 디스크에 영속 저장."""
+        """
+        Semantic memory를 디스크에 저장.
+        FIX: _dirty가 False이면 불필요한 I/O를 건너뜀.
+        """
         if not self._conn_address:
+            return
+        if not self._dirty:
             return
         try:
             self._path(self._conn_address).write_text(
                 json.dumps(self.semantic.to_dict(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._dirty = False
         except Exception:
             pass
+
+    def flush_if_dirty(self) -> None:
+        """
+        중요 사실 발견 직후 즉시 보존이 필요한 경우 명시적으로 호출.
+        constraints, failed namespace 변경 시 권장.
+        """
+        if self._dirty:
+            self.save()
 
     # ── 기록 헬퍼 ──────────────────────────────────────────────
 
     def remember(self, namespace: str, key: str, value) -> None:
-        """Semantic memory에 사실 기록 + 즉시 디스크 저장."""
+        """
+        Semantic memory에 사실 기록.
+
+        FIX v2: 매 호출마다 디스크 write하지 않고 _dirty = True 표시.
+        constraints / failed namespace는 즉시 flush (데이터 손실 위험이 높음).
+        나머지는 배치 저장 (loop의 done() / 세션 종료 시).
+        """
         self.semantic.set(namespace, key, value)
-        self.save()
+        self._dirty = True
+        # 물리 제약과 실패 이력은 즉시 보존 — 세션 중단 시 재발견 비용이 크다
+        if namespace in ("constraints", "failed"):
+            self.flush_if_dirty()
 
     def record_episode(self, tool: str, result: str, ok: bool) -> None:
-        """Episodic memory에 사건 추가. 최근 100개만 유지."""
         self.episodic.append(Episode.from_result(tool, result, ok))
         if len(self.episodic) > 100:
             self.episodic = self.episodic[-100:]
@@ -219,12 +231,10 @@ class ECCMemory:
     # ── 조회 헬퍼 ──────────────────────────────────────────────
 
     def to_system_context(self) -> str:
-        """loop.py system_with_state에 추가할 컨텍스트 문자열."""
         parts = []
         wm = self.working.to_context()
         if wm:
             parts.append(wm)
-        # 최근 실패 에피소드 3개 — escalation이 집계하기 전 패턴을 LLM이 직접 인지
         failed_eps = [e for e in self.episodic[-10:] if not e.ok][-3:]
         if failed_eps:
             ep_lines = ["[Recent failures]"]
@@ -237,10 +247,6 @@ class ECCMemory:
         return "\n\n".join(parts)
 
     def get_persistent_facts(self) -> str:
-        """
-        compactor.py가 압축 후에도 보존할 사실 문자열.
-        constraints와 failed는 반드시 포함.
-        """
         lines = []
         for ns in ("constraints", "hardware", "protocol"):
             for k, v in self.semantic.ns(ns).items():
@@ -253,10 +259,6 @@ class ECCMemory:
         return "\n".join(lines)
 
     def can_execute(self, task_hint: str) -> tuple[bool, str]:
-        """
-        SayCan-style affordance check — Task Graph 없이.
-        semantic.hardware 기반으로 실행 가능성 검사.
-        """
         hint = task_hint.lower()
         hw = self.semantic.hardware
 
@@ -269,40 +271,24 @@ class ECCMemory:
 
         return True, ""
 
-    # ── typed working memory updater ──────────────────────────────
-
     def update_working(self, **kwargs) -> None:
-        """WorkingMemory 필드를 키워드 인자로 일괄 업데이트.
-
-        직접 속성 접근 대신 이 메서드를 사용하면
-        존재하지 않는 필드를 조용히 무시해서 런타임 오류를 방지.
-        예: memory.update_working(current_step="모터 속도 확인", turn=3)
-        """
         for key, value in kwargs.items():
             if hasattr(self.working, key):
                 setattr(self.working, key, value)
 
     # ── typed semantic remember helpers ───────────────────────────
-    # remember("namespace", key, value) 보다 오타가 없고 IDE 자동완성 지원
 
     def remember_hardware(self, key: str, value) -> None:
-        """hardware namespace에 저장. 예: motor_topic, serial_ports."""
         self.remember("hardware", key, value)
 
     def remember_protocol(self, key: str, value) -> None:
-        """protocol namespace에 저장. 예: baud_rate, qos."""
         self.remember("protocol", key, value)
 
     def remember_constraint(self, key: str, value) -> None:
-        """constraints namespace에 저장. 예: min_erpm, max_speed_ms."""
         self.remember("constraints", key, value)
 
     def remember_failed_approach(self, key: str, value) -> None:
-        """failed namespace에 저장. 재시도 방지용.
-        예: remember_failed_approach("pub_once_loop", "ARG_MAX timeout")
-        """
         self.remember("failed", key, value)
 
     def remember_skill(self, key: str, value) -> None:
-        """skill namespace에 저장. 재사용 가능한 검증 스크립트."""
         self.remember("skill", key, value)
