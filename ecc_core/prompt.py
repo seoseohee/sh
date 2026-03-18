@@ -83,27 +83,73 @@ _SECTION_PHASE2 = """\
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## Phase 2: Orient — Identify the System Type
 
-Fire this one-liner immediately after connecting:
+Detection runs in THREE layers. Stop as soon as you have a confident type.
+Always prioritize signals relevant to the goal over general inventory.
 
-  bash(\"uname -srm && cat /etc/os-release 2>/dev/null | grep -E '^(NAME|VERSION)=' && \
-ls /opt/ros/ 2>/dev/null && echo 'HAS_ROS' || true && \
-ls /dev/ttyACM* /dev/ttyUSB* /dev/ttyS* 2>/dev/null | head -5 && \
+### Layer 1: What is the goal asking for? (zero cost — read before touching the board)
+
+Before running any command, extract keywords from the goal:
+
+  Goal keywords              Highest-priority signal to check first
+  ────────────────────────────────────────────────────────────────
+  ros2, node, topic, launch  Is ROS2 middleware running?
+  serial, uart, arduino,     Are serial devices present and accessible?
+    stm32, esp32, mcu
+  i2c, spi, gpio, sensor     Are i2c/spi buses present?
+  http, api, mqtt, rest,     Are relevant ports open and services running?
+    plc, modbus
+  file, log, config, service Are specific files or services the target?
+
+Use this to prioritize which Layer 2 signal to read first.
+
+### Layer 2: Running processes — most reliable type signal (~100ms)
+
+Fire this FIRST, before any device enumeration:
+
+  bash(\"ps aux 2>/dev/null | grep -v grep | grep -iE '(ros2|roslaunch|roscore|ros2_daemon|rosmaster)' | head -5 && \
+echo '---' && \
+systemctl list-units --state=running --type=service 2>/dev/null | \
+grep -iE '(ros|serial|mqtt|mosquitto|modbus|opcua|node-red|pigpio|gpsd)' | head -10 && \
+echo '---' && \
+ss -tlnp 2>/dev/null | grep -E ':(1883|8080|8883|502|102|4840|9090)' | head -5\")
+
+Interpret immediately:
+
+  Signal (running, not just installed)    Definitive type
+  ──────────────────────────────────────────────────────────
+  ros2_daemon / roscore process running   robot_mw   → go to Phase 3-A
+  mosquitto / node-red on 1883/8080       net_device → go to Phase 3-D
+  modbus/opcua service on 502/4840        net_device → go to Phase 3-D
+  pigpio / gpsd / i2c-related service     linux_iot  → go to Phase 3-C
+
+If Layer 2 gives a definitive answer, SKIP Layer 3.
+
+### Layer 3: Device and software inventory — fallback only
+
+Run only if Layer 2 was inconclusive:
+
+  bash(\"uname -srm && \
+ls /opt/ros/ 2>/dev/null && echo 'ROS_INSTALLED' || true && \
+ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | head -5 && \
 ls /dev/i2c-* /dev/spidev* /dev/gpiochip* 2>/dev/null | head -5 && \
-python3 --version 2>/dev/null && \
 ip addr show 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | head -3\")
 
-Read the result and identify ONE primary system type:
+  Signal (installed/present, not necessarily running)   Likely type
+  ──────────────────────────────────────────────────────────────────
+  /opt/ros present + matches goal keywords              robot_mw
+  /dev/ttyACM* or /dev/ttyUSB*                          serial_mcu
+  /dev/i2c-* or /dev/spidev* or /dev/gpiochip*          linux_iot
+  Open ports / network clues                            net_device
+  None of the above                                     bare_linux
 
-  Signal                          Type            Next step
-  ───────────────────────────────────────────────────────────────
-  HAS_ROS / /opt/ros exists       robot_mw        probe(target=\"sw\"), then Phase 3-A
-  /dev/ttyACM* or /dev/ttyUSB*    serial_mcu      probe(target=\"motors\"), then Phase 3-B
-  /dev/i2c-* or /dev/spidev*      linux_iot       probe(target=\"hw\"), then Phase 3-C
-  Open ports / REST API clues     net_device      probe(target=\"net\"), then Phase 3-D
-  None of the above               bare_linux      probe(target=\"all\"), then Phase 3-E
+### Decision rules
 
-Mixed signals (e.g., ROS2 + serial) -> pick the type that matches the goal, handle others as sub-tasks.
-Stop investigating when you have enough to act.
+1. Always match the detected type against the GOAL — if there is a conflict
+   (e.g., ROS2 is installed but the goal is about an I2C sensor), trust the goal.
+2. Mixed signals → pick the type that matches the goal, note others in memory.
+3. If board memory already has ssh_profile or hardware facts, use them — skip
+   redundant detection for known information.
+4. Stop investigating when you have enough to act. Over-probing wastes turns.
 
 """
 
