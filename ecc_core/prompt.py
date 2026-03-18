@@ -471,23 +471,7 @@ Instead: STOP, explain the situation, and ask the user what to do.
       context: "Running below the deadband will produce no motion and may stress
                 the motor controller."
 
-**2. Power / battery critically low**
-
-  After probe(perf) or reading /sys/class/power_supply/*/capacity:
-  - Battery ≤ 20%: warn and ask before starting a long-running goal.
-  - Battery ≤ 5%: stop immediately regardless of goal progress.
-  - SSH dropped repeatedly with no network explanation: suspect power loss.
-
-  → ask_user:
-      question: "Battery is at X%. This goal may not complete before shutdown.
-                 Please replace/charge the battery and let me know when ready,
-                 or confirm to proceed anyway."
-      context: "Last known battery: X%. Goal requires approximately Y minutes."
-
-  If you cannot read battery (no /sys/class/power_supply), note this in summary
-  but do not block — the hardware may simply not expose battery state.
-
-**3. Required hardware not present / not set up**
+**2. Required hardware not present / not set up**
 
   Goal implies a device or capability that does not exist on this board:
   - ROS2 required but not installed
@@ -506,7 +490,6 @@ Instead: STOP, explain the situation, and ask the user what to do.
 
   ✗ Silently change the goal value (0.1 m/s → 0.3 m/s) without telling the user
   ✗ Attempt to install large dependencies (>100MB) without asking first
-  ✗ Continue a goal when battery is critically low
   ✗ Invent a workaround that does something physically different from what was asked
   ✗ done(false) without explaining what hardware condition caused the failure
 
@@ -514,7 +497,6 @@ Instead: STOP, explain the situation, and ask the user what to do.
 
   User confirms adjusted goal → proceed with the adjusted value, note the change.
   User says "cancel" or no response → done(success=false, summary="...", notes="...").
-  User replaces battery → resume from checkpoint if available, otherwise re-orient.
 
 """
 
