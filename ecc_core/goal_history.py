@@ -1,8 +1,8 @@
 """
-ecc_core/goal_history.py — Goal 달성 이력
+ecc_core/goal_history.py — Goal achievement history
 
-~/.ecc/history.jsonl 에 세션 요약 기록.
-REPL에서 /history 명령으로 조회 가능.
+Records session summaries to ~/.ecc/history.jsonl.
+Accessible via /history command in REPL.
 """
 
 import json
@@ -23,7 +23,7 @@ def record_goal(
     tokens_in:    int = 0,
     tokens_out:   int = 0,
 ) -> None:
-    """세션 종료 시 goal 이력 기록."""
+    """Record goal history on session end."""
     _HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "ts":           time.time(),
@@ -43,7 +43,7 @@ def record_goal(
 
 
 def load_history(last_n: int = 20) -> list[dict]:
-    """최근 N개 이력 로드."""
+    """Load last N history entries."""
     if not _HISTORY_PATH.exists():
         return []
     try:
@@ -55,9 +55,9 @@ def load_history(last_n: int = 20) -> list[dict]:
 
 
 def format_history(entries: list[dict]) -> str:
-    """REPL /history 출력용 포맷."""
+    """Format for REPL /history output."""
     if not entries:
-        return "  (이력 없음)"
+        return "  ((no history))"
     lines = []
     for e in entries:
         ts      = time.strftime("%m/%d %H:%M", time.localtime(e["ts"]))

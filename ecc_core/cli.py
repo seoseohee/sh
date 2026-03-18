@@ -10,12 +10,12 @@ def main():
         prog="ecc",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
-        예시:
-          python ecc.py "시스템 상태 확인"
-          python ecc.py "1m/s로 3초 주행"
-          python ecc.py --host 192.168.1.100 "차량 주행"
-          python ecc.py   # REPL 모드
-          python ecc.py --history  # 이전 작업 이력 조회
+        Examples:
+          python ecc.py "check system status"
+          python ecc.py "drive at 1m/s for 3 seconds"
+          python ecc.py --host 192.168.1.100 "drive vehicle"
+          python ecc.py   # REPL mode
+          python ecc.py --history  # Show goal history
         """)
     )
     parser.add_argument("goal", nargs="?", default=None)
@@ -24,19 +24,19 @@ def main():
     parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--max-turns", type=int, default=100)
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--history", action="store_true", help="이전 goal 이력 출력")
+    parser.add_argument("--history", action="store_true", help="Show previous goal history")
     args = parser.parse_args()
 
-    # --history 플래그
+    # --history flag
     if args.history:
         entries = load_history(last_n=30)
-        print(f"\n{'─'*60}\n  📋 최근 goal 이력 ({len(entries)}개)\n{'─'*60}")
+        print(f"\n{'─'*60}\n  📋 Recent goal history ({len(entries)})\n{'─'*60}")
         print(format_history(entries))
         print()
         return
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("❌ ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
+        print("❌ ANTHROPIC_API_KEY environment variable is not set.")
         print("   export ANTHROPIC_API_KEY=sk-ant-...")
         sys.exit(1)
 
@@ -52,28 +52,28 @@ def main():
         try:
             agent.run(args.goal + hint, max_turns=args.max_turns)
         except KeyboardInterrupt:
-            print("\n\n  ⚡ 중단됨")
+            print("\n\n  ⚡ Interrupted")
     else:
         # REPL
         model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
-        print(f"\n{'═'*60}\n  🤖 ECC  [{model}]\n  goal 입력. /quit 종료, /history 이력\n{'═'*60}\n")
+        print(f"\n{'═'*60}\n  🤖 ECC  [{model}]\n  Enter goal. /quit to exit, /history for history\n{'═'*60}\n")
         while True:
             try:
                 prompt = f"ecc[{len(agent._session_messages)}]> " if agent._session_messages else "ecc> "
                 raw = input(prompt).strip()
             except (EOFError, KeyboardInterrupt):
-                print("\n  종료합니다.")
+                print("\n  Exiting..")
                 break
             if not raw: continue
             if raw.lower() in ("/quit", "/q", "/exit"):
-                print("  종료합니다."); break
+                print("  Exiting.."); break
             if raw.lower() in ("/new", "/reset"):
                 agent._session_messages = []
                 agent._session_goal = ""
                 agent._session_todos = None
                 agent._session_executor = None
                 agent._session_memory = None
-                print("  🆕 새 세션"); continue
+                print("  🆕 New session"); continue
             if raw.lower() in ("/history", "/h"):
                 entries = load_history(last_n=20)
                 print(format_history(entries)); continue
@@ -81,6 +81,6 @@ def main():
                 agent.run(raw + hint, max_turns=args.max_turns)
             except KeyboardInterrupt:
                 agent._save_partial_session()
-                print("\n  ⚡ 중단. 다음 goal을 입력하세요.")
+                print("\n  ⚡ Interrupted. Enter next goal..")
             except Exception as e:
-                print(f"\n  ❌ 오류: {e}")
+                print(f"\n  ❌ Error: {e}")

@@ -1,10 +1,10 @@
 """ecc_core/escalation.py — EscalationTracker.
 
-반복 실패 감지 → opus+thinking 자동 전환.
-트리거 조건 (OR):
-  1. verify FAIL 2회 연속  (ECC_ESCALATE_VERIFY_STREAK)
-  2. 직전 2개 tool_result에 동일한 하드웨어 실패 패턴  (ECC_ESCALATE_PATTERN_COUNT)
-  3. 같은 bash 명령 3회 이상 반복 (polling 제외)  (ECC_ESCALATE_BASH_REPEAT)
+Detect repeated failures → auto-switch to opus+thinking.
+Trigger conditions (OR):
+  1. verify FAIL N consecutive  (ECC_ESCALATE_VERIFY_STREAK)
+  2. Same hardware failure pattern in last N results  (ECC_ESCALATE_PATTERN_COUNT)
+  3. Same bash command N+ times (excluding polling)  (ECC_ESCALATE_BASH_REPEAT)
 """
 import os
 
@@ -55,15 +55,15 @@ class EscalationTracker:
         bash_repeat     = _esc_int("ECC_ESCALATE_BASH_REPEAT",   3)
 
         if self._verify_fail_streak >= verify_streak:
-            return True, f"verify FAIL {self._verify_fail_streak}회 연속"
+            return True, f"verify FAIL streak: {self._verify_fail_streak}"
         if len(self._recent_results) >= pattern_count:
             last_n = self._recent_results[-pattern_count:]
             for kw in self.FAIL_KEYWORDS:
                 if all(kw in r for r in last_n):
-                    return True, f"동일 실패 패턴: '{kw}'"
+                    return True, f"Same failure pattern: '{kw}'"
         for cmd, count in self._bash_counter.items():
             if count >= bash_repeat:
-                return True, f"bash {count}회 반복: '{cmd[:60]}'"
+                return True, f"bash repeated {count}x: '{cmd[:60]}'"
         return False, ""
 
     def get_recent_results(self) -> list[str]:

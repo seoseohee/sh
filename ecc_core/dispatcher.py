@@ -1,9 +1,9 @@
-"""ecc_core/dispatcher.py — Tool 실행 디스패처.
+"""ecc_core/dispatcher.py — Tool execution dispatcher.
 
-AgentLoop에서 tool 실행 관련 책임을 분리:
-  - 병렬 / 직렬 tool 분기
-  - ssh_connect 처리
-  - subagent 라우팅 (SubagentRole)
+Tool execution responsibilities separated from AgentLoop:
+  - parallel / serial tool branching
+  - ssh_connect handling
+  - subagent routing (SubagentRole)
   - _handle_ssh_connect, _check_connection
 """
 
@@ -15,13 +15,13 @@ from .todo       import TodoManager
 from .tool_schemas import get_tool_definitions
 
 
-# ── Subagent 역할 ──────────────────────────────────────────
+# ── Subagent roles ──────────────────────────────────────────
 
 class SubagentRole:
     """
-    EXPLORER  — 탐색/조사 전용. 시스템 상태 변경 불가.
-    SETUP     — 설치/설정/파일 쓰기 실행 가능.
-    VERIFIER  — verify/probe/read-only bash 특화.
+    EXPLORER  — Exploration/investigation only. No state modification.
+    SETUP     — Can install, configure, write files.
+    VERIFIER  — specialized for verify/probe/read-only bash.
     """
     EXPLORER = "explorer"
     SETUP    = "setup"
@@ -29,7 +29,7 @@ class SubagentRole:
 
 
 def _subagent_config(role: str, conn: BoardConnection, context: str) -> tuple:
-    """역할별 (system_prompt, tools) 반환."""
+    """Return (system_prompt, tools) per role."""
     base_ssh  = f"SSH: {conn.user}@{conn.host}:{conn.port}"
     known_ctx = f"\nAlready known:\n{context}" if context else ""
 
@@ -95,7 +95,7 @@ def run_subagent(
     verbose: bool = False,
     role:    str  = SubagentRole.EXPLORER,
 ) -> str:
-    """역할 기반 서브에이전트 실행."""
+    """Role-based subagent execution."""
     import os
     from .tool_schemas import get_tool_definitions
 
@@ -188,18 +188,18 @@ PARALLEL_TOOLS = {
 
 class ToolDispatcher:
     """
-    tool_blocks를 받아 병렬/직렬로 실행하고 all_results를 반환.
+    Receive tool_blocks, execute in parallel/serial, return all_results.
 
-    책임:
-      - PARALLEL_TOOLS 분기
-      - ssh_connect 처리
-      - subagent 라우팅
+    Responsibilities:
+      - PARALLEL_TOOLS branching
+      - ssh_connect handling
+      - subagent routing
       - can_execute affordance check
-      - SSH 재연결 감지
+      - SSH reconnect detection
     """
 
     def __init__(self, agent_loop):
-        self._loop = agent_loop  # conn, client, verbose 접근용
+        self._loop = agent_loop  # access conn, client, verbose
 
     @property
     def conn(self) -> "BoardConnection | None":
@@ -212,7 +212,7 @@ class ToolDispatcher:
         memory:      ECCMemory,
         messages:    list[dict],
     ) -> dict[str, str]:
-        """tool_blocks 실행 → {block.id: result_str}."""
+        """Execute tool_blocks → {block.id: result_str}."""
         serial_blocks   = [b for b in tool_blocks if b.name not in PARALLEL_TOOLS or self.conn is None]
         parallel_blocks = [b for b in tool_blocks if b.name in PARALLEL_TOOLS and self.conn is not None]
 
@@ -287,7 +287,7 @@ class ToolDispatcher:
         print(f"\n  🔗 ssh_connect: host={host} user={user or 'auto'} port={port}", flush=True)
 
         if host.lower() == "scan" or not host:
-            # v4: SSH 프로파일 캐시 먼저 시도 (탐색 시간 절감)
+            # v4: Try SSH profile cache first (reduce discovery time)
             loop = self._loop
             if hasattr(loop, '_session') and loop._session._saved_memory:
                 profile = loop._session._saved_memory.get_ssh_profile()
@@ -296,18 +296,18 @@ class ToolDispatcher:
                     cached_user = profile.get("user", "")
                     cached_port = int(profile.get("host_port", ":22").split(":")[-1]) if ":" in profile.get("host_port", "") else 22
                     if cached_host:
-                        print(f"  ⚡ SSH 프로파일 캐시 시도: {cached_user}@{cached_host}:{cached_port}", flush=True)
+                        print(f"  ⚡ Trying SSH profile cache: {cached_user}@{cached_host}:{cached_port}", flush=True)
                         conn = BoardDiscovery.from_hint(cached_host, cached_user, cached_port)
                         if conn:
                             self._loop.conn = conn
-                            print(f"  ✅ 캐시 연결 성공: {conn.address}")
+                            print(f"  ✅ Cache connect succeeded: {conn.address}")
                             return f"[ssh_connect ok] Connected to {conn.address} (cached)"
 
-            print("  🔍 네트워크 자동 탐색 중...", flush=True)
+            print("  🔍 Scanning network......", flush=True)
             conn = BoardDiscovery.scan(user=user, port=port)
             if conn:
                 self._loop.conn = conn
-                print(f"  ✅ 발견 및 연결: {conn.address}")
+                print(f"  ✅ Discovered and connected: {conn.address}")
                 return f"[ssh_connect ok] Connected to {conn.address}"
             subnets = ", ".join(BoardDiscovery._default_subnets()[:4])
             users   = ", ".join(BoardDiscovery._default_users())
@@ -319,7 +319,7 @@ class ToolDispatcher:
         conn = BoardDiscovery.from_hint(host, user, port)
         if conn:
             self._loop.conn = conn
-            print(f"  ✅ 연결: {conn.address}")
+            print(f"  ✅ Connected: {conn.address}")
             return f"[ssh_connect ok] Connected to {conn.address}"
         return (
             f"[ssh_connect failed] Could not connect to {host}:{port}\n"
@@ -331,11 +331,11 @@ class ToolDispatcher:
             return
         if not (self.conn.likely_disconnected or not self.conn.is_alive()):
             return
-        print("\n  🔄 연결 끊김, 재연결 시도...", flush=True)
+        print("\n  🔄 Connection lost, attempting reconnect......", flush=True)
         if self.conn.reconnect(max_attempts=3):
-            print("  ✅ 재연결 성공")
+            print("  ✅ Reconnect succeeded")
             messages.append({"role": "user", "content": "[SSH reconnected] Check board state."})
         else:
-            print("  ❌ 재연결 실패.")
+            print("  ❌ Reconnect failed..")
             self._loop.conn = None
             messages.append({"role": "user", "content": "[SSH lost] Use ssh_connect to reconnect."})

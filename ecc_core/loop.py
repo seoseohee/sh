@@ -1,19 +1,19 @@
 """
-ecc_core/loop.py — AgentLoop (얇은 오케스트레이터)
+ecc_core/loop.py — AgentLoop (thin orchestrator)
 
-v4 분리:
+v4 separation:
   escalation.py  — EscalationTracker
   session.py     — SessionManager, SessionState
   dispatcher.py  — ToolDispatcher, SubagentRole, run_subagent
 
-이 파일이 하는 일:
-  - LLM API 호출 (Anthropic client)
-  - turn 루프 + escalation 조정
-  - verifier feedback annotation 주입
-  - 세 모듈 조합
+Responsibilities:
+  - LLM API calls (Anthropic client)
+  - turn loop + escalation management
+  - verifier feedback annotation injection
+  - three-module orchestration
 
-하위 호환 re-export:
-  SubagentRole, run_subagent — 이 파일에서도 임포트 가능.
+Backward-compatible re-exports:
+  SubagentRole, run_subagent — importable from this file too.
 """
 
 import os
@@ -42,7 +42,7 @@ from .goal_history  import record_goal
 
 
 # ─────────────────────────────────────────────────────────────
-# 환경변수 헬퍼
+# Environment variable helpers
 # ─────────────────────────────────────────────────────────────
 
 def _env_int(key: str, default: int) -> int:
@@ -95,10 +95,10 @@ class AgentLoop:
         self.client     = anthropic.Anthropic()
         self.conn: BoardConnection | None = None
         self._session   = SessionManager()
-        # REPL용 프로퍼티 (cli.py 하위 호환)
+        # REPL properties (cli.py backward compat)
         self._session_messages  = property(lambda self: self._session.saved_messages)
 
-    # ── cli.py 하위 호환 프로퍼티 ──────────────────────────────
+    # ── cli.py backward-compat properties ──────────────────────────────
 
     @property
     def _session_messages(self) -> list[dict]:
@@ -140,19 +140,19 @@ class AgentLoop:
     def _session_memory(self, v):
         self._session._saved_memory = v
 
-    # ── 메인 루프 ──────────────────────────────────────────────
+    # ── Main loop ──────────────────────────────────────────────
 
     def run(self, goal: str, max_turns: int = 100):
         print(f"\n{'═'*60}\n  🎯 {goal[:80]}\n{'═'*60}")
 
         if self.conn and not self.conn.is_alive():
-            print("  ⚠️  이전 연결 끊어짐.")
+            print("  ⚠️  Previous connection lost..")
             self.conn = None
 
-        # 세션 초기화 (SessionManager)
+        # Session init (SessionManager)
         state, is_followup = self._session.init_session(goal, self.conn, self.verbose)
         if is_followup:
-            print(f"  🔁 이전 세션 이어받기 ({len(self._session.saved_messages)}개 메시지)", flush=True)
+            print(f"  🔁 Resuming previous session ({len(self._session.saved_messages)} messages)", flush=True)
 
         messages  = state.messages
         todos     = state.todos
@@ -160,17 +160,17 @@ class AgentLoop:
         memory    = state.memory
         active_goal = state.goal
 
-        # 디스패처
+        # Dispatcher
         disp = ToolDispatcher(self)
 
         tracer     = Tracer(goal=active_goal[:80])
 
-        # ── 체크포인트 복원 (SSH 단절 후 재시작 시) ──────────────
+        # ── Checkpoint restore (after SSH disconnect) ──────────────
         if not is_followup and memory.checkpoint_exists():
             restored = memory.checkpoint_load()
             if restored and memory.working.goal:
                 print(
-                    f"\n  ♻️  체크포인트 복원 — 이전 turn={memory.working.turn}"
+                    f"\n  ♻️  Checkpoint restored — previous turn={memory.working.turn}"
                     f", step='{memory.working.current_step[:40]}'",
                     flush=True,
                 )
@@ -202,7 +202,7 @@ class AgentLoop:
 
         while True:
 
-            # 컨텍스트 압축
+            # Context compression
             if should_compact(messages):
                 facts    = memory.get_persistent_facts()
                 messages = compact(messages, active_goal, todos.format_for_llm(),
@@ -212,7 +212,7 @@ class AgentLoop:
             conn_status = (
                 f"[Connected: {self.conn.address}]" if self.conn else "[Not connected]"
             )
-            # v4: 현재 tool 실행 컨텍스트를 쿼리로 사용해 관련 메모리만 주입
+            # v4: use current tool context as query to inject only relevant memory
             _mem_query = f"{active_goal} {memory.working.current_step} {memory.working.last_action}"
             system_with_state = (
                 system
@@ -222,7 +222,7 @@ class AgentLoop:
                 + (f"\n\n{todos.format_nag()}" if todos.format_nag() else "")
             )
 
-            # ── LLM 호출 ───────────────────────────────────────
+            # ── LLM call ───────────────────────────────────────
             try:
                 escalate, reason = escalation.should_escalate()
                 turn_model       = _escalate_model() if escalate else model
@@ -276,7 +276,7 @@ class AgentLoop:
 
             except anthropic.RateLimitError:
                 wait = 60
-                print(f"\n  ⏳ Rate limit — {wait}초 대기...", flush=True)
+                print(f"\n  ⏳ Rate limit — {wait}s wait...", flush=True)
                 time.sleep(wait)
                 continue
 
@@ -291,13 +291,13 @@ class AgentLoop:
                     continue
                 raise
 
-            # 중복 append 방지
+            # Prevent duplicate append
             last_asst = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
             if last_asst and last_asst["content"] is resp.content:
                 continue
             messages.append({"role": "assistant", "content": resp.content})
 
-            # 출력
+            # Output
             seen_text = False
             for block in resp.content:
                 if block.type == "thinking" and block.thinking.strip():
@@ -310,12 +310,12 @@ class AgentLoop:
 
             has_tools = any(b.type == "tool_use" for b in resp.content)
             if resp.stop_reason == "end_turn" and not has_tools:
-                print("\n  ⚠️  done() 없이 멈춤.", flush=True)
+                print("\n  ⚠️  Stopped without done()..", flush=True)
                 messages.append({"role": "user", "content":
                     "[system] Call done() or continue working toward the goal."})
                 continue
 
-            # ── Tool 실행 (ToolDispatcher) ──────────────────────
+            # ── Tool execution (ToolDispatcher) ──────────────────────
             tool_blocks = [b for b in resp.content if b.type == "tool_use"]
             all_results = disp.dispatch(tool_blocks, executor, memory, messages)
 
@@ -376,7 +376,7 @@ class AgentLoop:
             if _in_prog:
                 memory.working.current_step = _in_prog[0].content[:100]
 
-            # tool_results 조립
+            # assemble tool_results
             tool_results = []
             for block in tool_blocks:
                 out = all_results.get(block.id, "[error] no result")
@@ -392,10 +392,10 @@ class AgentLoop:
                 self._session.save(state)
                 memory.checkpoint_clear()
 
-                # v4: Episodic → Semantic 자동 통합
+                # v4: Episodic → Semantic auto-consolidation
                 consolidate_episodic(memory, active_goal, self.client)
 
-                # v4: 세션 비용 집계 + goal 이력 기록
+                # v4: session cost tally + goal history record
                 tok_in, tok_out = tracer.get_token_totals()
                 tracer.session_end(success=True, summary=f"done() after {turn} turns")
                 record_goal(
@@ -412,28 +412,28 @@ class AgentLoop:
                 disp.check_connection(messages)
 
             memory.working.turn = turn
-            memory.checkpoint_save()  # Working + Episodic 턴마다 보존
+            memory.checkpoint_save()  # preserve Working + Episodic each turn
             turn += 1
             if turn >= max_turns:
-                print(f"\n  ⚠️  {turn} turns — 계속 진행...", flush=True)
+                print(f"\n  ⚠️  {turn} turns — continuing...", flush=True)
                 messages.append({"role": "user", "content":
                     f"[system] {turn} turns. Keep working. Call done() only when finished."})
                 max_turns += 50
 
     def _save_partial_session(self):
-        """KeyboardInterrupt 시 cli.py에서 호출."""
+        """Called by cli.py on KeyboardInterrupt."""
         state = self._session._current_state_snapshot()
         if state:
             self._session.save_partial(*state)
 
     @staticmethod
     def _is_followup(goal: str, has_session: bool) -> bool:
-        """하위 호환용. SessionManager.is_followup() 위임."""
+        """Backward compat. Delegates to SessionManager.is_followup()."""
         return SessionManager.is_followup(goal, has_session)
 
 
 # ─────────────────────────────────────────────────────────────
-# 출력 헬퍼
+# Output helpers
 # ─────────────────────────────────────────────────────────────
 
 def _print_thinking(text: str) -> None:

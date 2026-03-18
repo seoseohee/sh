@@ -1,4 +1,4 @@
-"""ecc_core/registry.py — Probe/Verify 플러그인 레지스트리 (SWE-Agent ACI 패턴)."""
+"""ecc_core/registry.py — Probe/Verify plugin registry (SWE-Agent ACI pattern)."""
 
 import os
 import importlib.util
@@ -6,7 +6,7 @@ import pathlib
 
 
 class _Registry:
-    """런타임 등록 가능한 명령 레지스트리."""
+    """Command registry with runtime registration."""
 
     def __init__(self, base: dict):
         self._commands: dict[str, str] = dict(base)
@@ -27,7 +27,7 @@ class _Registry:
 
 
 def _load_plugins(registry_type: str) -> dict:
-    """ECC_PLUGIN_DIR 환경변수에서 외부 플러그인 로드."""
+    """Load external plugins from ECC_PLUGIN_DIR env var."""
     plugin_dir = os.environ.get("ECC_PLUGIN_DIR", "")
     if not plugin_dir:
         return {}

@@ -1,4 +1,4 @@
-"""ecc_core/tracer.py - JSONL 에이전트 트레이서 + 세션 비용 모니터링 (v2)"""
+"""ecc_core/tracer.py - JSONL agent tracer + session cost monitoring (v2)"""
 
 import json
 import re
@@ -19,7 +19,7 @@ def _model_cost(model: str, tokens_in: int, tokens_out: int) -> float:
 
 
 class Tracer:
-    """JSONL 기반 에이전트 트레이서. enabled=False이면 모든 메서드가 no-op."""
+    """JSONL-based agent tracer. All methods are no-ops when enabled=False."""
 
     def __init__(self, goal: str, enabled: bool = True):
         self.enabled = enabled
@@ -92,8 +92,8 @@ class Tracer:
             esc   = stats["escalated_calls"]
             print(
                 f"\n  {'='*60}\n"
-                f"  세션 비용: {tok:,} tokens | ~${cost:.4f} USD"
-                f" | LLM {calls}회 (에스컬레이션 {esc}회)",
+                f"  Session cost: {tok:,} tokens | ~${cost:.4f} USD"
+                f" | LLM {calls} calls (escalated {esc})",
                 flush=True,
             )
         return stats

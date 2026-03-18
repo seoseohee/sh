@@ -1,40 +1,40 @@
 """
 ecc_core/reflection.py
 
-Reflexion 패턴 구현 (Shinn et al., NeurIPS 2023)
+Reflexion pattern implementation (Shinn et al., NeurIPS 2023)
 
-실패 유형을 분류하고 3-way replanning 목적지 결정:
-  RETRY_SAME_TASK   — 파라미터만 바꿔서 재시도 (연결/타임아웃 등 일시 오류)
-  REVISE_TASK_GRAPH — goal 유지, 하위 task 수정 (물리 제약 발견)
-  REPLAN_FROM_ROOT  — goal 재해석, LLM Planner 복귀 (구조적 불가능)
+Classify failure type and decide 3-way replanning destination:
+  RETRY_SAME_TASK   — retry with adjusted params (transient errors: connection/timeout)
+  REVISE_TASK_GRAPH — keep goal, revise sub-tasks (physical constraint discovered)
+  REPLAN_FROM_ROOT  — reinterpret goal, return to LLM Planner (structurally impossible)
 
-classify_failure()  : 최근 tool_result 텍스트에서 실패 유형 분류
-generate_reflection(): LLM 호출로 "왜 실패했는가" 언어 생성
-make_reflection_message(): loop.py messages에 주입할 user 메시지 생성
+classify_failure()  : classify failure type from recent tool_result text
+generate_reflection(): call LLM to generate verbal failure analysis
+make_reflection_message(): create user message to inject into loop.py messages
 """
 
 import anthropic
 
 
 # ─────────────────────────────────────────────────────────────
-# Replan Decision 상수 + typed dataclass
+# Replan Decision constants + typed dataclass
 # ─────────────────────────────────────────────────────────────
 
 from dataclasses import dataclass
 
 class ReplanDecision:
-    RETRY_SAME_TASK   = "retry"   # 같은 도구, 파라미터만 변경
-    REVISE_TASK_GRAPH = "revise"  # goal 유지, 방법 전환
-    REPLAN_FROM_ROOT  = "replan"  # 전략 재수립
+    RETRY_SAME_TASK   = "retry"   # same tool, change parameters only
+    REVISE_TASK_GRAPH = "revise"  # keep goal, switch method
+    REPLAN_FROM_ROOT  = "replan"  # full strategy reset
 
 
 @dataclass
 class RecoveryDecision:
-    """분류된 실패 유형 + 행동 힌트를 함께 전달.
+    """Carry classified failure type + action hint together.
 
-    route: ReplanDecision 상수 (retry / revise / replan)
-    note:  LLM에게 전달할 구체적 행동 지침
-    reason: verifier.py의 reason 문자열 (선택)
+    route: ReplanDecision constant (retry / revise / replan)
+    note:  concrete action guidance for the LLM
+    reason: verifier.py reason string (optional)
     """
     route: str
     note: str
@@ -42,8 +42,8 @@ class RecoveryDecision:
 
 
 # ─────────────────────────────────────────────────────────────
-# verifier reason → RecoveryDecision 매핑
-# (recovery.py 패턴을 reflection.py에 통합)
+# verifier reason → RecoveryDecision mapping
+# (recovery.py pattern integrated into reflection.py)
 # ─────────────────────────────────────────────────────────────
 
 _VERIFIER_ROUTING: dict[str, RecoveryDecision] = {
@@ -73,7 +73,7 @@ _VERIFIER_ROUTING: dict[str, RecoveryDecision] = {
 def route_from_verifier(verifier_reason: str) -> RecoveryDecision:
     """verifier.py reason → RecoveryDecision.
 
-    verify_execution() 결과를 바로 recovery decision으로 변환.
+    Directly convert verify_execution() result to recovery decision.
     """
     return _VERIFIER_ROUTING.get(
         verifier_reason,
@@ -85,17 +85,17 @@ def route_from_verifier(verifier_reason: str) -> RecoveryDecision:
     )
 
 
-# 실패 키워드 → replan 목적지
-# 매칭 우선순위: 위에서 아래로
+# failure keyword → replan destination
+# match priority: top to bottom
 FAILURE_ROUTING: list[tuple[str, str]] = [
-    # ── 일시적 연결/실행 문제 → 재시도
+    # ── transient connection/execution errors → retry
     ("timeout after",        ReplanDecision.RETRY_SAME_TASK),
     ("connection refused",   ReplanDecision.RETRY_SAME_TASK),
     ("no route to host",     ReplanDecision.RETRY_SAME_TASK),
     ("ssh_connect failed",   ReplanDecision.RETRY_SAME_TASK),
     ("rc=-1",                ReplanDecision.RETRY_SAME_TASK),
 
-    # ── 물리 제약 발견 → 방법 수정
+    # ── physical constraint found → revise method
     ("speed: 0.0",           ReplanDecision.REVISE_TASK_GRAPH),
     ("speed=0.0",            ReplanDecision.REVISE_TASK_GRAPH),
     ("no data",              ReplanDecision.REVISE_TASK_GRAPH),
@@ -106,7 +106,7 @@ FAILURE_ROUTING: list[tuple[str, str]] = [
     ("qos mismatch",         ReplanDecision.REVISE_TASK_GRAPH),
     ("no new message",       ReplanDecision.REVISE_TASK_GRAPH),
 
-    # ── 구조적 불가능 → 전략 재수립
+    # ── structurally impossible → full strategy reset
     ("command not found",    ReplanDecision.REPLAN_FROM_ROOT),
     ("not installed",        ReplanDecision.REPLAN_FROM_ROOT),
     ("no such file",         ReplanDecision.REPLAN_FROM_ROOT),
@@ -114,7 +114,7 @@ FAILURE_ROUTING: list[tuple[str, str]] = [
     ("exit code 127",        ReplanDecision.REPLAN_FROM_ROOT),
 ]
 
-# REPLAN 결정에 따른 액션 힌트
+# Action hints per replan decision
 _ACTION_HINT: dict[str, str] = {
     ReplanDecision.RETRY_SAME_TASK: (
         "The failure looks transient (connection/timeout). "
@@ -133,13 +133,13 @@ _ACTION_HINT: dict[str, str] = {
 
 
 # ─────────────────────────────────────────────────────────────
-# 실패 분류
+# Failure classification
 # ─────────────────────────────────────────────────────────────
 
 def classify_failure(recent_results: list[str]) -> str:
     """
-    최근 tool_result 텍스트에서 실패 유형 분류.
-    매칭 없으면 REPLAN_FROM_ROOT (unknown → LLM이 판단).
+    Classify failure type from recent tool_result text.
+    No match → REPLAN_FROM_ROOT (unknown, LLM decides).
     """
     combined = " ".join(r.lower() for r in recent_results[-4:])
     for keyword, decision in FAILURE_ROUTING:
@@ -149,7 +149,7 @@ def classify_failure(recent_results: list[str]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Reflection 생성 (LLM 호출)
+# Reflection generation (LLM call)
 # ─────────────────────────────────────────────────────────────
 
 def generate_reflection(
@@ -163,11 +163,11 @@ def generate_reflection(
         import os
         model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
     """
-    Reflexion 패턴 — 실패 이유를 언어로 생성.
-    EscalationTracker 트리거 시 호출.
-    결과를 messages에 주입하면 다음 turn LLM에 반영됨.
+    Reflexion pattern — generate verbal failure reason.
+    Called when EscalationTracker fires.
+    Result injected into messages is seen by LLM next turn.
     """
-    # 최근 6개 메시지만 사용 (비용 절약)
+    # Use only last 6 messages (cost saving)
     recent = messages[-6:] if len(messages) >= 6 else messages
 
     system = (
@@ -201,13 +201,13 @@ def generate_reflection(
 
 
 # ─────────────────────────────────────────────────────────────
-# messages 주입용 메시지 생성
+# Create message for injection into messages
 # ─────────────────────────────────────────────────────────────
 
 def make_reflection_message(reflection_text: str, decision: str) -> dict:
     """
-    reflection 결과를 loop.py messages에 user 메시지로 주입.
-    에이전트가 다음 turn에 이 내용을 참조해서 다른 접근을 취한다.
+    Inject reflection result as user message into loop.py messages.
+    Agent sees this next turn and takes a different approach.
     """
     action = {
         ReplanDecision.RETRY_SAME_TASK:   "Retry with adjusted parameters.",

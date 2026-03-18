@@ -1,11 +1,11 @@
 """
 ecc_core/executor.py
 
-LLM이 요청한 tool_use를 실제 보드 명령으로 실행한다.
+Executes tool_use requests from the LLM as actual board commands.
 
-수정 이력:
-  v2 — _ask_user 클래스 밖 정의 버그 수정 (AttributeError 방지)
-       done() 호출 시 background task 완료 대기 추가 (race condition 방지)
+Changelog:
+  v2 — Fixed _ask_user defined outside class (AttributeError)
+       Added background task completion wait on done() (race condition fix)
 """
 
 import json
@@ -23,8 +23,6 @@ from .todo import TodoManager
 if TYPE_CHECKING:
     pass
 
-
-# ── 백그라운드 task 저장소 ─────────────────────────────────────────
 
 @dataclass
 class _BgTask:
@@ -51,8 +49,8 @@ class _BgTask:
 
 class ToolExecutor:
     """
-    각 도구 이름을 받아서 실제 동작으로 디스패치.
-    done이 호출되면 is_finished = True.
+    Dispatches tool names to actual operations.
+    Sets is_finished = True when done() is called.
     """
 
     def __init__(self, conn, todos: TodoManager, memory=None, verbose: bool = False):
@@ -68,8 +66,8 @@ class ToolExecutor:
         handler = getattr(self, f"_{tool_name}", None)
         if handler is None:
             return (
-                f"[error] 알 수 없는 도구: {tool_name}\n"
-                f"사용 가능한 도구: "
+                f"[error] Unknown tool: {tool_name}\n"
+                f"Available tools: "
                 + ", ".join(
                     n[1:] for n in dir(self)
                     if n.startswith("_") and not n.startswith("__")
@@ -90,16 +88,11 @@ class ToolExecutor:
         _print_tool("bash", f"{cmd[:100]}", desc)
 
         if is_dangerous(cmd):
-            return "[blocked] 위험한 명령으로 판단되어 실행을 거부했습니다."
+            return "[blocked] Dangerous command rejected."
 
-        # ── 물리 안전 guard (Edge IoT 보안 논문 기반) ───────────────────
-        # constraints memory의 max_erpm / max_speed 등을 초과하는
-        # 명령을 사전 차단 — is_dangerous()의 소프트웨어 레이어 너머
-        # 하드웨어 손상 방지용 가드
         safety_warn = self._physical_safety_check(cmd)
         if safety_warn:
             return f"[safety_blocked] {safety_warn}"
-        # ────────────────────────────────────────────────────────────────
 
         if background:
             task_id = _uuid_mod.uuid4().hex[:8]
@@ -112,11 +105,11 @@ class ToolExecutor:
 
             t = threading.Thread(target=_run, daemon=True)
             t.start()
-            print(f"    ⏳ background task_id={task_id}", flush=True)
+            print(f"    Background task_id={task_id}", flush=True)
             return (
                 f"[background] task_id={task_id}\n"
-                f"Command is running in background. "
-                f"Use bash_wait(task_id='{task_id}') to retrieve the result."
+                f"Command running in background. "
+                f"Use bash_wait(task_id='{task_id}') to retrieve result."
             )
 
         if self.conn is None:
@@ -124,7 +117,6 @@ class ToolExecutor:
         else:
             result = self.conn.run(cmd, timeout=timeout)
 
-            # Level 1 자동 재시도 (일시적 timeout 흡수)
             if (
                 not result.ok
                 and result.rc == -1
@@ -132,7 +124,7 @@ class ToolExecutor:
                 and not background
             ):
                 retry_timeout = min(timeout * 2, 120)
-                print(f"    ⟳ timeout 감지 — {retry_timeout}s로 재시도...", flush=True)
+                print(f"    Timeout detected — retrying with {retry_timeout}s...", flush=True)
                 result = self.conn.run(cmd, timeout=retry_timeout)
 
         _print_result(result)
@@ -154,7 +146,7 @@ class ToolExecutor:
         finished = task.wait(timeout=wait_timeout)
         if not finished:
             return (
-                f"[timeout] task_id={task_id} is still running after {wait_timeout}s.\n"
+                f"[timeout] task_id={task_id} still running after {wait_timeout}s.\n"
                 "Call bash_wait again with a longer timeout, or continue other work."
             )
 
@@ -172,7 +164,7 @@ class ToolExecutor:
         desc = inp.get("description", "")
 
         lines = code.strip().splitlines()
-        _print_tool("script", f"[{interpreter}] {len(lines)}줄", desc)
+        _print_tool("script", f"[{interpreter}] {len(lines)} lines", desc)
 
         if self.verbose:
             preview = "\n    ".join(lines[:6])
@@ -284,9 +276,8 @@ class ToolExecutor:
     def _probe(self, inp: dict) -> str:
         target = inp["target"]
 
-        _print_tool("probe", f"[{target}]", "하드웨어/환경 탐지")
+        _print_tool("probe", f"[{target}]", "hardware/env detection")
 
-        # v3: probe_registry 우선 조회 (플러그인 포함), fallback으로 PROBE_COMMANDS
         from .tools import probe_registry
         cmd = probe_registry.get(target)
         if not cmd:
@@ -294,7 +285,7 @@ class ToolExecutor:
             cmd = PROBE_COMMANDS.get(target)
         if not cmd:
             available = probe_registry.list_targets()
-            return f"[error] 알 수 없는 probe target: {target}. 사용 가능: {available}"
+            return f"[error] Unknown probe target: {target}. Available: {available}"
 
         timeout = 60 if target == "parallel_scan" else 45
         result = self.conn.run(cmd, timeout=timeout)
@@ -333,12 +324,12 @@ class ToolExecutor:
                 f"[serial_open failed] {port} @ {baudrate}\n"
                 f"{check.to_tool_result()}\n"
                 "Hints:\n"
-                "- 포트 경로 확인: probe(target='hw')\n"
-                "- 권한 확인: bash('ls -la /dev/ttyACM* /dev/ttyUSB*')\n"
-                "- pyserial 설치: bash('pip3 install pyserial --break-system-packages')"
+                "- Check port path: probe(target='hw')\n"
+                "- Check permissions: bash('ls -la /dev/ttyACM* /dev/ttyUSB*')\n"
+                "- Install pyserial: bash('pip3 install pyserial --break-system-packages')"
             )
 
-        print(f"    ✅ serial session_id={session_id}  ({port} @ {baudrate})", flush=True)
+        print(f"    serial session_id={session_id}  ({port} @ {baudrate})", flush=True)
         return (
             f"[serial_open ok] session_id={session_id}\n"
             f"port={port} baudrate={baudrate} timeout={timeout}\n"
@@ -420,8 +411,8 @@ class ToolExecutor:
         if not session_id:
             n = len(self._serial_sessions)
             self._serial_sessions.clear()
-            _print_tool("serial_close", "all", f"{n}개 세션 닫기")
-            return f"[serial_close] {n}개 세션 모두 닫음."
+            _print_tool("serial_close", "all", f"closing {n} sessions")
+            return f"[serial_close] {n} sessions closed."
 
         _print_tool("serial_close", f"session={session_id}")
 
@@ -430,7 +421,7 @@ class ToolExecutor:
 
         sess = self._serial_sessions.pop(session_id)
         history_count = len(sess["history"])
-        print(f"    ✅ closed {sess['port']} (송수신 {history_count}회)", flush=True)
+        print(f"    Closed {sess['port']} (io count: {history_count})", flush=True)
         return (
             f"[serial_close ok] session_id={session_id} closed.\n"
             f"port={sess['port']} | total io={history_count}"
@@ -443,7 +434,7 @@ class ToolExecutor:
         self.todos.update(todos)
         formatted = self.todos.format_display()
         print(f"\n{formatted}")
-        return f"[ok] todo 업데이트됨\n{self.todos.format_for_llm()}"
+        return f"[ok] todo updated\n{self.todos.format_for_llm()}"
 
     # ─── remember ──────────────────────────────────────────────
 
@@ -453,10 +444,10 @@ class ToolExecutor:
         value = inp.get("value")
 
         if not key:
-            return "[error] remember: key는 필수입니다"
+            return "[error] remember: key is required"
 
         if self.memory is None:
-            return "[warn] remember: memory가 초기화되지 않음. ssh_connect 후 호출하세요"
+            return "[warn] remember: memory not initialized. Call ssh_connect first."
 
         self.memory.remember(ns, key, value)
         _print_tool("remember", f"[{ns}] {key} = {value}")
@@ -468,19 +459,19 @@ class ToolExecutor:
         target = inp["target"]
         device = inp.get("device", "")
 
-        _print_tool("verify", f"[{target}] {device}", "동작 확인")
+        _print_tool("verify", f"[{target}] {device}", "hardware verification")
 
         if target == "custom":
             if device:
                 result = self.conn.run(device, timeout=30)
             else:
-                return "[error] custom verify: device에 확인할 bash 명령을 넣어라"
+                return "[error] custom verify: put the bash command to run in the device field"
             _print_result(result)
             return result.to_tool_result()
 
         cmd_template = VERIFY_COMMANDS.get(target)
         if not cmd_template:
-            return f"[error] 알 수 없는 verify target: {target}"
+            return f"[error] Unknown verify target: {target}"
 
         cmd = f"export ECC_DEVICE='{device}'\n{cmd_template}"
         result = self.conn.run(cmd, timeout=60)
@@ -498,19 +489,13 @@ class ToolExecutor:
     def _subagent(self, inp: dict) -> str:
         return "[error] subagent must be handled by AgentLoop, not ToolExecutor"
 
-    # ─── 물리 안전 guard ───────────────────────────────────────
+    # ─── physical safety guard ─────────────────────────────────
 
     def _physical_safety_check(self, cmd: str) -> str:
         """
-        constraints memory 기반 물리 안전 사전 검증.
+        Pre-execution physical constraint validation based on constraints memory.
 
-        Edge IoT 보안 논문(2026) 기반:
-        is_dangerous()가 소프트웨어 레벨 위험(rm -rf 등)을 막는다면,
-        이 메서드는 하드웨어 물리 제약을 초과하는 명령을 사전 차단한다.
-
-        반환값:
-          ""    — 안전 (통과)
-          str   — 위험 이유 (차단)
+        Returns "" if safe, or a reason string if blocked.
         """
         if self.memory is None:
             return ""
@@ -520,7 +505,6 @@ class ToolExecutor:
 
         cmd_lower = cmd.lower()
 
-        # ERPM 한계 검사 — VESC 모터 컨트롤러
         max_erpm = constraints.get("max_erpm")
         if max_erpm is not None:
             for m in __import__("re").finditer(r"data[\"']?\s*[:=]\s*(\d+(?:\.\d+)?)", cmd):
@@ -529,12 +513,11 @@ class ToolExecutor:
                     if val > float(max_erpm):
                         return (
                             f"ERPM {val} > max_erpm {max_erpm} (constraints memory). "
-                            f"Use a value ≤ {max_erpm} to prevent motor damage."
+                            f"Use a value <= {max_erpm} to prevent motor damage."
                         )
                 except ValueError:
                     pass
 
-        # 속도 한계 검사 — ROS2 cmd_vel / AckermannDrive
         max_speed = constraints.get("max_speed_ms") or constraints.get("max_speed")
         if max_speed is not None:
             for m in __import__("re").finditer(
@@ -545,12 +528,11 @@ class ToolExecutor:
                     if val > float(max_speed):
                         return (
                             f"Speed {val} m/s > max_speed {max_speed} m/s (constraints memory). "
-                            f"Use a value ≤ {max_speed} m/s."
+                            f"Use a value <= {max_speed} m/s."
                         )
                 except ValueError:
                     pass
 
-        # 온도 한계 — 히터/액추에이터 제어
         max_temp = constraints.get("max_temp_c")
         if max_temp is not None:
             for m in __import__("re").finditer(r"temp\w*\s*[=:]\s*(\d+(?:\.\d+)?)", cmd_lower):
@@ -558,7 +540,7 @@ class ToolExecutor:
                     val = float(m.group(1))
                     if val > float(max_temp):
                         return (
-                            f"Temperature {val}°C > max_temp {max_temp}°C (constraints memory)."
+                            f"Temperature {val}C > max_temp {max_temp}C (constraints memory)."
                         )
                 except ValueError:
                     pass
@@ -566,8 +548,6 @@ class ToolExecutor:
         return ""
 
     # ─── ask_user ──────────────────────────────────────────────
-    # FIX: 기존 코드에서 클래스 밖(_local_write 아래)에 잘못 정의되어
-    #      AttributeError를 유발하던 버그를 클래스 안으로 이동하여 수정
 
     def _ask_user(self, inp: dict) -> str:
         question = inp["question"]
@@ -575,14 +555,14 @@ class ToolExecutor:
 
         print("\n" + "─" * 60, flush=True)
         if context:
-            print(f"  ℹ️  {context}", flush=True)
-        print(f"  ❓ {question}", flush=True)
+            print(f"  Info: {context}", flush=True)
+        print(f"  Question: {question}", flush=True)
         print("─" * 60, flush=True)
         try:
-            answer = input("  답변: ").strip()
+            answer = input("  Answer: ").strip()
         except (EOFError, KeyboardInterrupt):
             answer = ""
-            print("\n  (입력 없음 — 빈 답변으로 처리)", flush=True)
+            print("\n  (no input — treating as empty)", flush=True)
 
         if not answer:
             return "[ask_user] No answer provided. Proceed with best-effort assumption."
@@ -596,36 +576,30 @@ class ToolExecutor:
         evidence = inp.get("evidence", "")
         notes = inp.get("notes", "")
 
-        # FIX: done() 호출 전 실행 중인 background task 경고
-        # race condition 방지 — 아직 완료되지 않은 bg task가 있으면 알림
         running = [tid for tid, t in self._bg_tasks.items() if not t.done]
         if running:
             print(
-                f"\n  ⚠️  done() 호출 시 background task {running} 아직 실행 중.",
+                f"\n  Warning: done() called with background tasks still running: {running}",
                 flush=True
             )
 
         if self._serial_sessions:
             n = len(self._serial_sessions)
-            print(f"\n  🔌 열린 serial 세션 {n}개 자동 닫기...", flush=True)
+            print(f"\n  Auto-closing {n} open serial session(s)...", flush=True)
             self._serial_sessions.clear()
 
-        icon = "✅" if success else "❌"
-        print(f"\n{'═'*60}")
-        print(f"  {icon}  {summary}")
+        icon = "OK" if success else "FAIL"
+        print(f"\n{'='*60}")
+        print(f"  [{icon}] {summary}")
         if evidence:
-            print(f"  🔍 Evidence: {evidence}")
+            print(f"  Evidence: {evidence}")
         if notes:
-            print(f"  📝 {notes}")
-        print(f"{'═'*60}")
+            print(f"  Notes: {notes}")
+        print(f"{'='*60}")
 
         self.is_finished = True
         return "done"
 
-
-# ─────────────────────────────────────────────────────────────
-# 로컬 실행 헬퍼
-# ─────────────────────────────────────────────────────────────
 
 def _local_run(cmd: str, timeout: int = 30) -> ExecResult:
     import time
@@ -663,13 +637,9 @@ def _local_write(path: str, content: str, mode: str = "") -> ExecResult:
         return ExecResult(ok=False, stdout="", stderr=str(e), rc=1)
 
 
-# ─────────────────────────────────────────────────────────────
-# 출력 헬퍼
-# ─────────────────────────────────────────────────────────────
-
 def _print_tool(name: str, detail: str = "", desc: str = ""):
     desc_str = f"  # {desc}" if desc else ""
-    print(f"\n  ▶ {name}  {detail}{desc_str}", flush=True)
+    print(f"\n  > {name}  {detail}{desc_str}", flush=True)
 
 def _print_result(result: ExecResult, max_chars: int = 4000):
     out = result.output()
@@ -678,6 +648,6 @@ def _print_result(result: ExecResult, max_chars: int = 4000):
     if len(out) > max_chars:
         head = out[:max_chars // 2]
         tail = out[-(max_chars // 4):]
-        out = f"{head}\n  ...({len(out)}자 truncated)...\n{tail}"
+        out = f"{head}\n  ...({len(out)} chars truncated)...\n{tail}"
     for line in out.splitlines():
         print(f"  {line}", flush=True)

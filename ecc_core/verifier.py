@@ -1,11 +1,11 @@
 """
 ecc_core/verifier.py
 
-v3 변경 (EmbedAgent ICSE 2026 기반):
-  - parse_error_feedback(): 에러 텍스트 → 구조화 피드백 변환
-    EmbedAgent 논문의 "compiler feedback loop" 패턴을 임베디드 도메인에 적용.
-  - verify_execution(): tool_name 기반 판정 (v2 유지)
-  - verify_motion(): 물리 동작 특화 검증 + feedback 필드 추가
+v3 changes (based on EmbedAgent ICSE 2026):
+  - parse_error_feedback(): error text → structured feedback
+    Applies EmbedAgent paper's 'compiler feedback loop' pattern to embedded domain.
+  - verify_execution(): tool_name-based judgment (v2 retained)
+  - verify_motion(): physical motion verification + feedback field
 """
 
 from __future__ import annotations
@@ -23,51 +23,51 @@ _ERROR_KW    = ("error", "failed", "exception", "traceback", "rc=-1")
 # (pattern, error_type, root_cause, suggested_fix, retry_safe)
 _ERROR_RULES: list[tuple[str, str, str, str, bool]] = [
     (r"package '(.+?)' not found",
-     "missing_dep", "ROS2 패키지 미설치",
-     "sudo apt-get install -y ros-$ROS_DISTRO-{pkg} 실행", False),
+     "missing_dep", "ROS2 package not installed",
+     "run sudo apt-get install -y ros-$ROS_DISTRO-{pkg}", False),
     (r"No executable found|ExecutableNotFound",
-     "missing_dep", "ROS2 실행 파일 없음",
-     "패키지 설치 및 source setup.bash 확인", False),
+     "missing_dep", "ROS2 executable not found",
+     "install package and verify source setup.bash", False),
     (r"QoS mismatch|incompatible QoS",
-     "ros2_error", "ROS2 QoS 불일치",
-     "publisher/subscriber QoS 맞추거나 --qos-reliability best_effort 사용", False),
+     "ros2_error", "ROS2 QoS mismatch",
+     "Match publisher/subscriber QoS or use --qos-reliability best_effort", False),
     (r"no new message|no data",
-     "ros2_error", "ROS2 토픽 데이터 없음 — publisher 없거나 QoS 불일치",
-     "ros2 topic info로 publisher 수 확인, QoS 확인", False),
+     "ros2_error", "ROS2 topic has no data — no publisher or QoS mismatch",
+     "Check publisher count with ros2 topic info, verify QoS", False),
     (r"Failed to import|ModuleNotFoundError|ImportError",
-     "missing_dep", "Python 패키지 미설치",
+     "missing_dep", "Python package not installed",
      "pip3 install {module} --break-system-packages", False),
     (r"serial\.SerialException|could not open port|No such file or directory.*tty",
-     "serial_error", "시리얼 포트 없음 또는 권한 없음",
-     "ls /dev/tty* 로 포트 확인, sudo chmod a+rw /dev/ttyACM0", False),
+     "serial_error", "Serial port missing or permission denied",
+     "ls /dev/tty* to check port, sudo chmod a+rw /dev/ttyACM0", False),
     (r"Permission denied.*tty|permission denied.*serial",
-     "permission", "시리얼 포트 접근 권한 없음",
-     "sudo chmod a+rw /dev/ttyACM0 또는 usermod -a -G dialout $USER", False),
+     "permission", "Serial port permission denied",
+     "sudo chmod a+rw /dev/ttyACM0 or usermod -a -G dialout $USER", False),
     (r"Permission denied|Operation not permitted",
-     "permission", "파일/디바이스 접근 권한 없음",
-     "sudo 실행 또는 chmod/chown으로 권한 부여", False),
+     "permission", "File/device permission denied",
+     "Run with sudo or fix permissions via chmod/chown", False),
     (r"fault_code|FAULT|overcurrent|overvoltage|overtemp",
-     "hardware_fault", "하드웨어 fault 감지",
-     "전원/배선 확인, fault 코드 조회 후 reset 필요", False),
+     "hardware_fault", "Hardware fault detected",
+     "Check power/wiring, read fault code, then reset", False),
     (r"timeout after|timed out",
-     "ssh_error", "SSH 또는 명령 타임아웃",
-     "timeout 값 증가 또는 보드 연결 상태 확인", True),
+     "ssh_error", "SSH or command timeout",
+     "Increase timeout or check board connection", True),
     (r"Connection reset|Broken pipe|ssh.*closed",
-     "ssh_error", "SSH 연결 끊김",
-     "ssh_connect()로 재연결 후 재시도", True),
+     "ssh_error", "SSH connection lost",
+     "Reconnect via ssh_connect() then retry", True),
     (r"command not found|No such file.*bin|not installed",
-     "missing_dep", "명령 또는 패키지 미설치",
-     "apt-get install 또는 pip3 install로 설치", False),
+     "missing_dep", "Command or package not installed",
+     "apt-get install or install via pip3", False),
 ]
 
 
 def parse_error_feedback(result_text: str) -> "dict | None":
     """
-    tool_result 텍스트에서 구조화 에러 피드백 추출.
+    Extract structured error feedback from tool_result text.
 
-    EmbedAgent 논문의 compiler feedback loop:
-    에러를 그대로 LLM에 넘기는 대신 유형/원인/수정 힌트로 구조화해서
-    LLM이 불필요한 탐색 없이 바로 수정 행동을 취하게 함.
+    EmbedAgent paper's compiler feedback loop:
+    Instead of passing raw errors to the LLM, structure them as type/cause/fix hints
+    so the LLM can take corrective action without unnecessary exploration.
     """
     if not result_text:
         return None
@@ -96,8 +96,8 @@ def parse_error_feedback(result_text: str) -> "dict | None":
             return {"error_type": error_type, "root_cause": root_cause,
                     "suggested_fix": suggested_fix, "retry_safe": retry_safe}
 
-    return {"error_type": "generic", "root_cause": "알 수 없는 오류",
-            "suggested_fix": "에러 메시지를 확인하고 원인을 분석하세요", "retry_safe": False}
+    return {"error_type": "generic", "root_cause": "Unknown error",
+            "suggested_fix": "Check the error message and analyze the root cause", "retry_safe": False}
 
 
 def verify_execution(tool_name: str, observation: dict) -> dict:
@@ -145,8 +145,8 @@ def verify_motion(evidence: str) -> dict:
         "evidence": evidence[:300],
         "feedback": None if ok else {
             "error_type":    "hardware_fault",
-            "root_cause":    "물리 동작 미확인 — 모터 deadband 또는 명령 미전달",
-            "suggested_fix": "telemetry 확인, ERPM/속도 임계값 점검, constraints memory 확인",
+            "root_cause":    "Motion not confirmed — motor deadband or command not delivered",
+            "suggested_fix": "Check telemetry, ERPM/speed thresholds, constraints memory",
             "retry_safe":    False,
         },
     }

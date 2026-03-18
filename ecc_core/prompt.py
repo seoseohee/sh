@@ -1,14 +1,14 @@
 """
 ecc_core/prompt.py
 
-ECC — Embedded Claude Code 시스템 프롬프트.
+ECC — Embedded Claude Code system prompt.
 
-v3: 일반화 — 어떤 임베디드 시스템에도 적용 가능하도록 전면 재작성.
-    ROS2/VESC/Ackermann 특화 코드 제거.
-    Phase 2: 범용 one-liner → 5개 시스템 타입 자동 판별
-    Phase 3: 타입별 실행 패턴 (robot_mw / serial_mcu / linux_iot / net_device / bare_linux)
-    Phase 4: 도메인 독립 물리 제약 원칙
-    Phase 5: 스크립트 생성 패턴 (도메인 무관)
+v3: Generalized — fully rewritten to work on any embedded system.
+    Removed ROS2/VESC/Ackermann-specific code.
+    Phase 2: generic one-liner → auto-detect 5 system types
+    Phase 3: execution patterns per system type
+    Phase 4: domain-independent physical constraint principles
+    Phase 5: script generation patterns (domain-agnostic)
 """
 
 
@@ -34,7 +34,7 @@ def build_system_prompt() -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# Section 1: 사고 루프 (시스템 독립)
+# Section 1: Thinking loop (system-agnostic)
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_THINKING = """\
@@ -61,7 +61,7 @@ Key behaviors (non-negotiable):
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 2: Phase 1 — 연결
+# Section 2: Phase 1 — Connection
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_PHASE1 = """\
@@ -77,7 +77,7 @@ If board memory has ssh_profile, it will be tried automatically first.
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 3: Phase 2 — 환경 탐지 (범용 one-liner + 타입 판별)
+# Section 3: Phase 2 — Environment detection (generic one-liner + type detection)
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_PHASE2 = """\
@@ -155,7 +155,7 @@ ip addr show 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | head -3\")
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 4: Phase 3 — 타입별 실행 패턴
+# Section 4: Phase 3 — Execution patterns by system type
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_PHASE3 = """\
@@ -300,7 +300,7 @@ No special libraries assumed. Use bash/script with standard POSIX tools.
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 5: Phase 4 — 물리 제약 (도메인 독립)
+# Section 5: Phase 4 — Physical constraints (domain-independent)
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_PHASE4 = """\
@@ -351,7 +351,7 @@ must be wrapped in a single script() call.
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 6: Phase 5 — 스크립트 자가 확장
+# Section 6: Phase 5 — Script self-extension
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_PHASE5 = """\
@@ -394,7 +394,7 @@ When built-in tools are insufficient, write the tool inline with script().
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 7: Phase 6 — 검증
+# Section 7: Phase 6 — Verification
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_PHASE6 = """\
@@ -438,7 +438,7 @@ RIGHT: run the action in background, read feedback simultaneously:
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 8: 장애 플레이북 (범용)
+# Section 8: Failure playbook (generic)
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_HW_IMPOSSIBLE = """\
@@ -529,7 +529,7 @@ System-type specific diagnostics:
 """
 
 # ──────────────────────────────────────────────────────────────
-# Section 9: 도구 레퍼런스
+# Section 9: Tool reference
 # ──────────────────────────────────────────────────────────────
 
 _SECTION_TOOLS = """\

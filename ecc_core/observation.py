@@ -1,22 +1,22 @@
 """
 ecc_core/observation.py
 
-Observation Collector — tool_result를 공통 스키마로 정규화.
+Observation Collector — normalizes tool_result to a common schema.
 
-지금까지 observation이 tool_result / verify stdout / serial 응답 등으로
-흩어져 있던 것을 collect_observation() 하나로 통일.
+Previously observations were scattered across tool_result / verify stdout / serial responses etc.
+Now unified under collect_observation().
 
-반환 스키마:
+Return schema:
   {
-    "tool":     도구 이름,
-    "stdout":   표준 출력,
-    "stderr":   표준 오류,
-    "response": serial / HTTP 등 응답,
-    "ok":       성공 여부,
-    "raw":      원본 result 문자열,
+    "tool":     tool name,
+    "stdout":   standard output,
+    "stderr":   standard error,
+    "response": serial / HTTP response,
+    "ok":       success flag,
+    "raw":      raw result string,
   }
 
-verifier.py가 이 스키마만 보면 되도록 설계.
+Designed so verifier.py only needs to see this schema.
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ from __future__ import annotations
 
 def collect_observation(tool_name: str, result_text: str) -> dict:
     """
-    executor.execute() 반환 문자열을 공통 관찰 스키마로 변환.
+    Convert executor.execute() return string to common observation schema.
 
-    result_text: to_tool_result() 또는 executor._xxx() 반환값.
+    result_text: return value from to_tool_result() or executor._xxx().
     """
     text = result_text or ""
     ok = not (
@@ -36,14 +36,14 @@ def collect_observation(tool_name: str, result_text: str) -> dict:
         or "rc=-1" in text
     )
 
-    # stdout / stderr 분리 (ExecResult.output() 포맷 기준)
+    # separate stdout / stderr (based on ExecResult.output() format)
     stdout, stderr = text, ""
     if "[stderr]" in text:
         parts = text.split("[stderr]", 1)
         stdout = parts[0].strip()
         stderr = parts[1].strip() if len(parts) > 1 else ""
 
-    # serial response 추출 (RX_TEXT: 패턴)
+    # extract serial response (RX_TEXT: pattern)
     response = ""
     for line in text.splitlines():
         if line.startswith("RX_TEXT:"):

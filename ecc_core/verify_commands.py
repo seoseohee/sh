@@ -1,4 +1,4 @@
-"""ecc_core/verify_commands.py — 검증 쉘 명령 매핑."""
+"""ecc_core/verify_commands.py — Verification shell command mapping."""
 
 VERIFY_COMMANDS: dict[str, str] = {
     "serial_device": r"""

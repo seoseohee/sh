@@ -1,9 +1,9 @@
-"""ecc_core/session.py — 세션 상태 관리.
+"""ecc_core/session.py — Session state management.
 
-AgentLoop에서 세션 관련 책임을 분리:
-  - followup 판정 (_is_followup)
-  - 세션 상태 초기화 (새 goal vs 이어받기)
-  - 부분 세션 저장 (_save_partial_session)
+Session-related responsibilities separated from AgentLoop:
+  - followup detection (_is_followup)
+  - session state init (new goal vs resume)
+  - partial session save (_save_partial_session)
 """
 
 from dataclasses import dataclass, field
@@ -15,13 +15,13 @@ if TYPE_CHECKING:
     from .memory   import ECCMemory
 
 
-# 명시적 followup 접두어 — 이 외는 전부 새 goal로 처리
+# Explicit followup prefixes — anything else is treated as a new goal
 _FOLLOWUP_PREFIXES = ("/continue", "/resume", "/more", "/add", "/also")
 
 
 @dataclass
 class SessionState:
-    """현재 실행 중인 세션의 공유 상태."""
+    """Shared state for the currently running session."""
     messages:   list[dict]         = field(default_factory=list)
     goal:       str                = ""
     todos:      "TodoManager | None"  = None
@@ -30,7 +30,7 @@ class SessionState:
 
 
 class SessionManager:
-    """세션 초기화 + 부분 저장 담당."""
+    """Handles session init + partial save."""
 
     def __init__(self):
         self._saved_messages:  list[dict]         = []
@@ -41,10 +41,10 @@ class SessionManager:
 
     @staticmethod
     def is_followup(goal: str, has_session: bool) -> bool:
-        """명시적 접두어 기반 followup 판정.
+        """Followup detection based on explicit prefixes.
 
-        단어 수 휴리스틱을 사용하지 않는다.
-        '1m/s로 주행' 같은 짧은 새 goal이 followup으로 오판되는 버그 방지.
+        Word count heuristics are not used.
+        Prevents short new goals (e.g. 'drive at 1m/s') from being misclassified as followups.
         """
         if not has_session:
             return False
@@ -61,7 +61,7 @@ class SessionManager:
         verbose: bool,
     ) -> "tuple[SessionState, bool]":
         """
-        goal을 받아 SessionState를 초기화한다.
+        Initialize SessionState from goal.
 
         Returns:
           (state, is_followup)
@@ -104,7 +104,7 @@ class SessionManager:
         return state, followup
 
     def save(self, state: "SessionState") -> None:
-        """세션 종료 시 상태 보존."""
+        """Preserve state on session end."""
         self._saved_messages = list(state.messages)
         self._saved_goal     = state.goal
         self._saved_todos    = state.todos
@@ -121,7 +121,7 @@ class SessionManager:
         executor,
         memory,
     ) -> None:
-        """KeyboardInterrupt 등 중단 시 부분 저장."""
+        """Partial save on KeyboardInterrupt."""
         if messages:
             self._saved_messages = list(messages)
             self._saved_goal     = goal
@@ -132,7 +132,7 @@ class SessionManager:
                 memory.save()
 
     def reset(self) -> None:
-        """REPL /reset 명령 대응."""
+        """Handle REPL /reset command."""
         self._saved_messages = []
         self._saved_goal     = ""
         self._saved_todos    = None
@@ -140,7 +140,7 @@ class SessionManager:
         self._saved_memory   = None
 
     def _current_state_snapshot(self) -> "tuple | None":
-        """loop.py의 _save_partial_session()용 내부 스냅샷."""
+        """Internal snapshot for loop.py _save_partial_session()."""
         if not self._saved_messages:
             return None
         return (

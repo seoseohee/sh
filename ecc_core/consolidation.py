@@ -1,12 +1,12 @@
 """
-ecc_core/consolidation.py — Episodic → Semantic 자동 통합
+ecc_core/consolidation.py — Episodic → Semantic auto-consolidation
 
-세션 종료(done()) 또는 주기적으로 호출.
-에피소드 실패 패턴을 LLM이 분석해서 failed/constraints namespace에 자동 저장.
+Called on session end (done()) or periodically.
+LLM analyzes failed episode patterns and auto-saves to failed/constraints namespace.
 
-참고:
-  - Voyager / MetaGPT: 에피소드 트레이스 → 재사용 가능한 스킬/규칙 추상화
-  - AgeMem (Yu et al., 2026): 메모리 summarize를 에이전트 도구로
+References:
+  - Voyager / MetaGPT: episode traces → reusable skills/rules abstraction
+  - AgeMem (Yu et al., 2026): memory summarize as agent tool
 """
 
 import json
@@ -29,49 +29,49 @@ def consolidate_episodic(
     min_failures: int = 3,
 ) -> dict[str, int]:
     """
-    실패 에피소드를 분석해 Semantic Memory에 자동 통합.
+    Analyze failed episodes and auto-consolidate into Semantic Memory.
 
     Args:
-      memory:       ECCMemory 인스턴스
-      goal:         이번 세션의 goal (컨텍스트용)
-      client:       Anthropic 클라이언트
-      min_failures: 이 수 미만이면 패턴 추출 생략 (노이즈 방지)
+      memory:       ECCMemory instance
+      goal:         goal for this session (for context)
+      client:       Anthropic client
+      min_failures: skip pattern extraction below this count (noise prevention)
 
     Returns:
-      {"failed": N, "constraints": M}  — 저장된 항목 수
+      {"failed": N, "constraints": M}  — number of items saved
     """
     failed_eps = [e for e in memory.episodic if not e.ok]
     if len(failed_eps) < min_failures:
         return {"failed": 0, "constraints": 0}
 
-    # 인과 체인 재구성 — 연결된 실패 묶음
+    # Reconstruct causal chain — linked failure groups
     ep_text = "\n".join(
         f"turn={e.turn} tool={e.tool} caused_by={e.caused_by!r}: {e.summary[:100]}"
         for e in failed_eps[-25:]
     )
 
-    prompt = f"""임베디드 보드 자동화 세션에서 발생한 실패 에피소드를 분석해라.
+    prompt = f"""Analyze failed episodes from an embedded board automation session.
 
 Goal: {goal[:200]}
 
-실패 에피소드 (최근 순):
+Failed episodes (most recent first):
 {ep_text}
 
-아래 JSON만 출력하라. 다른 텍스트 없이.
+Output only the JSON below. No other text.
 {{
   "failed_patterns": [
-    {{"key": "짧은_식별자", "value": "실패 이유와 피해야 할 접근법 (한국어, 80자 이내)"}}
+    {{"key": "short_key", "value": "reason for failure and what to avoid (80 chars max)"}}
   ],
   "discovered_constraints": [
-    {{"key": "제약_이름", "value": "구체적 수치 또는 조건"}}
+    {{"key": "constraint_name", "value": "specific value or condition"}}
   ]
 }}
 
-규칙:
-- failed_patterns: 반복된 실패 또는 중요한 단일 실패만 포함. 최대 5개.
-- discovered_constraints: 물리적 한계(min_erpm, max_speed 등)가 에피소드에서 명확히 드러난 경우만.
-- 에피소드가 불충분하면 빈 리스트 반환.
-- 이미 알려진 정보 중복 저장 금지."""
+Rules:
+- failed_patterns: include only repeated failures or significant single failures. Max 5.
+- discovered_constraints: only when physical limits (min_erpm, max_speed etc.) are clearly evidenced.
+- Return empty lists if episodes are insufficient.
+- Do not store already-known information."""
 
     try:
         resp = client.messages.create(
@@ -80,7 +80,7 @@ Goal: {goal[:200]}
             messages=[{"role": "user", "content": prompt}]
         )
         raw = resp.content[0].text.strip() if resp.content else ""
-        # JSON 파싱
+        # JSON parse
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         if not m:
             return {"failed": 0, "constraints": 0}
@@ -95,7 +95,7 @@ Goal: {goal[:200]}
         key = str(item.get("key", "")).strip()
         val = str(item.get("value", "")).strip()
         if key and val:
-            # 이미 있는 키는 덮어쓰지 않음
+            # Don't overwrite existing keys
             if not memory.semantic.get("failed", key):
                 memory.remember("failed", key, val)
                 saved_failed += 1
@@ -110,7 +110,7 @@ Goal: {goal[:200]}
 
     if saved_failed + saved_constraints > 0:
         print(
-            f"\n  🧠 에피소드→시맨틱 통합: "
+            f"\n  🧠 episodic→semantic consolidation: "
             f"failed={saved_failed}, constraints={saved_constraints}",
             flush=True,
         )
@@ -125,14 +125,14 @@ def consolidate_skill(
     key:         str,
 ) -> None:
     """
-    검증된 스크립트를 Procedural Memory(skill namespace)에 저장.
-    executor.py의 _done() 또는 성공적인 script 실행 후 호출 가능.
+    Save a validated script to Procedural Memory (skill namespace).
+    Can be called from executor.py _done() or after successful script execution.
     """
     if not key or not script_code.strip():
         return
     existing = memory.semantic.get("skill", key)
     if existing:
-        return  # 이미 있으면 덮어쓰지 않음
+        return  # Don't overwrite if already exists
     memory.remember("skill", key, {
         "code":        script_code[:2000],
         "description": description[:200],

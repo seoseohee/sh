@@ -1,12 +1,12 @@
 """
 ecc_core/connection.py
 
-수정 이력:
-  v2 — BoardDiscovery.scan() IP 우선순위 보장.
-       기존: as_completed()는 응답 속도 순서로 결과를 돌려주어
-       known_hosts보다 서브넷 스캔 IP가 먼저 응답하면 우선순위가 무시됨.
-       수정: IP 그룹별 순차 시도 유지 + user 병렬 시도로 속도 확보.
-       첫 번째로 성공한 (IP 우선순위 존중) 연결을 반환.
+Changelog:
+  v2 — Ensure IP priority in BoardDiscovery.scan().
+       Old: as_completed() returns results by response speed,
+       so subnet IPs faster than known_hosts would wrongly win priority.
+       Fix: maintain sequential IP group order + parallel user attempts for speed.
+       Returns first successful connection respecting IP priority.
 """
 
 import platform
@@ -210,16 +210,16 @@ class BoardDiscovery:
     @classmethod
     def scan(cls, user=None, port=22):
         """
-        보드를 자동 탐색한다.
+        Auto-discover the board.
 
-        FIX v2: IP 우선순위 보장.
-        기존 코드는 IP 그룹별 순차 + user 병렬을 의도했으나
-        as_completed()가 완료 순서(응답 속도)로 결과를 돌려주어
-        우선순위가 낮은 서브넷 IP가 먼저 응답하면 잘못 선택됨.
+        FIX v2: Ensure IP priority.
+        Old code intended sequential IP groups + parallel users,
+        but as_completed() returns by completion order (response speed),
+        so lower-priority subnet IPs could be selected first.
 
-        수정: IP 그룹별 순차 유지.
-        각 IP에서 users를 병렬로 시도, 하나라도 성공하면 즉시 반환.
-        다음 IP 그룹으로 넘어가는 조건: 모든 user 시도 실패.
+        Fix: maintain sequential IP group order.
+        Try users in parallel per IP; return immediately on first success.
+        Move to next IP group only when all users fail.
         """
         candidates = []
         users = [user] if user else cls._default_users()
@@ -228,20 +228,20 @@ class BoardDiscovery:
             if ip and ip not in candidates:
                 candidates.append(ip)
 
-        # ① 환경변수 힌트
+        # 1. Env hint
         env_host = os.environ.get("ECC_BOARD_HOST")
         if env_host:
             _add(env_host)
 
-        # ② known_hosts
+        # 2. known_hosts
         for ip in cls._known_hosts_ips():
             _add(ip)
 
-        # ③ ARP 캐시
+        # ③ ARP cache
         for ip in cls._arp_cache_ips():
             _add(ip)
 
-        # ④ mDNS
+        # 4. mDNS
         for mdns_name in cls._default_mdns():
             try:
                 ip = socket.gethostbyname(mdns_name)
@@ -249,21 +249,21 @@ class BoardDiscovery:
             except Exception:
                 pass
 
-        # ⑤ 서브넷 ping 스캔
+        # 5. Subnet ping scan
         subnet_ips = cls._get_subnet_ips()
         if subnet_ips:
             workers = _env_int("ECC_SCAN_WORKERS", 200)
-            print(f"  🌐 {len(subnet_ips)}개 IP 병렬 스캔 (workers={workers})...", flush=True)
+            print(f"  🌐 {len(subnet_ips)} IPs parallel scan (workers={workers})...", flush=True)
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(cls._ping, ip): ip for ip in subnet_ips}
                 for future in as_completed(futures):
                     ip = future.result()
                     _add(ip)
 
-        print(f"  🔑 {len(candidates)}개 후보 SSH 확인...", flush=True)
+        print(f"  🔑 {len(candidates)} candidates to try via SSH...", flush=True)
 
-        # FIX: IP 우선순위 보장 — IP 순서대로 순차 시도
-        # 각 IP 내에서 users는 병렬 시도 (속도 확보)
+        # FIX: IP priority — try in order
+        # users tried in parallel per IP for speed
         for ip in candidates:
             conn = cls._try_ip(ip, users, port)
             if conn:
@@ -274,11 +274,11 @@ class BoardDiscovery:
     @classmethod
     def _try_ip(cls, ip: str, users: list, port: int) -> Optional["BoardConnection"]:
         """
-        단일 IP에 대해 user 목록을 병렬로 SSH 시도.
-        첫 번째 성공한 연결 반환, 모두 실패 시 None.
+        Try user list in parallel for a single IP.
+        Return first successful connection, None if all fail.
 
-        FIX: as_completed 결과를 순서 없이 받되,
-        성공 즉시 반환하고 나머지 future를 cancel (불필요한 연결 방지).
+        FIX: accept as_completed results in any order,
+        Return on first success and cancel remaining futures.
         """
         def _try(u):
             c = BoardConnection(ip, u, port)
@@ -289,7 +289,7 @@ class BoardDiscovery:
             for future in as_completed(futures):
                 result = future.result()
                 if result:
-                    # 나머지 future는 daemon thread라 자연 종료됨
+                    # remaining futures are daemon threads, they'll terminate naturally
                     return result
         return None
 

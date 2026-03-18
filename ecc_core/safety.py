@@ -1,4 +1,4 @@
-"""ecc_core/safety.py — 위험 명령 + 물리 안전 필터."""
+"""ecc_core/safety.py — Dangerous command + physical safety filter."""
 
 DANGEROUS_PATTERNS = [
     "rm -rf /", "rm -rf /*", "dd if=", "mkfs",
