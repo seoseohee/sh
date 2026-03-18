@@ -29,7 +29,6 @@ echo "=== CPU ===" && cat /proc/cpuinfo 2>/dev/null | grep -E "(model name|proce
 echo "=== 메모리 ===" && free -h 2>/dev/null
 echo "=== 디스크 ===" && df -h 2>/dev/null | grep -v tmpfs
 echo "=== 온도 ===" && cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | while read t; do echo "$((t/1000))°C"; done || echo "(온도 센서 없음)"
-echo "=== 배터리 ===" && for f in /sys/class/power_supply/*/capacity /sys/class/power_supply/*/status /sys/class/power_supply/*/voltage_now; do [ -r "$f" ] && echo "$(basename $(dirname $f))/$(basename $f): $(cat $f)"; done 2>/dev/null || echo "(배터리 정보 없음)"
 echo "=== 부하 ===" && uptime 2>/dev/null
 """.strip(),
 
