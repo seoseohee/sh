@@ -162,6 +162,31 @@ class AgentLoop:
         disp = ToolDispatcher(self)
 
         tracer     = Tracer(goal=active_goal[:80])
+
+        # ── 체크포인트 복원 (SSH 단절 후 재시작 시) ──────────────
+        if not is_followup and memory.checkpoint_exists():
+            restored = memory.checkpoint_load()
+            if restored and memory.working.goal:
+                print(
+                    f"\n  ♻️  체크포인트 복원 — 이전 turn={memory.working.turn}"
+                    f", step='{memory.working.current_step[:40]}'",
+                    flush=True,
+                )
+                messages.insert(0, {
+                    "role": "user",
+                    "content": (
+                        f"[Checkpoint restored] Previous session context:\n"
+                        f"  Prior goal: {memory.working.goal}\n"
+                        f"  Last turn: {memory.working.turn}\n"
+                        f"  Last step: {memory.working.current_step}\n"
+                        f"  Last action: {memory.working.last_action} → {memory.working.last_result}\n"
+                        f"  Failed episodes: {sum(1 for e in memory.episodic if not e.ok)}\n"
+                        "Resume or continue with the new goal above."
+                    )
+                })
+                tracer.note(f"checkpoint_restored: turn={memory.working.turn}")
+        # ─────────────────────────────────────────────────────────
+
         system     = build_system_prompt()
         model      = _main_model()
         max_tokens = _main_max_tokens()
@@ -360,6 +385,7 @@ class AgentLoop:
             if executor.is_finished:
                 state.messages = messages
                 self._session.save(state)
+                memory.checkpoint_clear()  # 완료된 세션의 체크포인트 삭제
                 tracer.session_end(success=True, summary=f"done() after {turn} turns")
                 break
 
@@ -367,6 +393,7 @@ class AgentLoop:
                 disp.check_connection(messages)
 
             memory.working.turn = turn
+            memory.checkpoint_save()  # Working + Episodic 턴마다 보존
             turn += 1
             if turn >= max_turns:
                 print(f"\n  ⚠️  {turn} turns — 계속 진행...", flush=True)

@@ -172,6 +172,13 @@ class ECCMemory:
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
+    def _checkpoint_path(self, addr: str) -> Path:
+        """Working + Episodic 체크포인트 파일 경로."""
+        key = addr.replace("@", "_at_").replace(":", "_port_").replace("/", "_")
+        p = Path(f"~/.ecc/memory/{key}.checkpoint.json").expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
     def _load(self, addr: str) -> None:
         path = self._path(addr)
         if path.exists():
@@ -198,6 +205,99 @@ class ECCMemory:
             self._dirty = False
         except Exception:
             pass
+
+    # ── 체크포인트 (Working + Episodic 휘발성 메모리 보존) ─────
+
+    def checkpoint_save(self) -> None:
+        """
+        Working Memory + Episodic Memory를 디스크에 체크포인트 저장.
+
+        SSH 단절 / 프로세스 종료 후 재시작 시 복원 가능하도록
+        매 turn 종료 후 loop.py에서 호출한다.
+        Semantic Memory와 별도 파일로 관리 (오염 방지).
+        """
+        if not self._conn_address:
+            return
+        try:
+            data = {
+                "working": {
+                    "goal":         self.working.goal,
+                    "current_step": self.working.current_step,
+                    "conn_address": self.working.conn_address,
+                    "turn":         self.working.turn,
+                    "last_action":  self.working.last_action,
+                    "last_result":  self.working.last_result,
+                },
+                "episodic": [
+                    {
+                        "ts":      e.ts,
+                        "tool":    e.tool,
+                        "summary": e.summary,
+                        "ok":      e.ok,
+                    }
+                    for e in self.episodic[-50:]  # 최근 50개만 보존
+                ],
+            }
+            self._checkpoint_path(self._conn_address).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def checkpoint_load(self) -> bool:
+        """
+        체크포인트 파일에서 Working + Episodic Memory 복원.
+
+        Returns:
+          True  — 복원 성공 (이전 세션 컨텍스트 있음)
+          False — 체크포인트 없거나 로드 실패
+        """
+        if not self._conn_address:
+            return False
+        path = self._checkpoint_path(self._conn_address)
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+
+            w = data.get("working", {})
+            self.working.goal         = w.get("goal", "")
+            self.working.current_step = w.get("current_step", "")
+            self.working.conn_address = w.get("conn_address", "")
+            self.working.turn         = w.get("turn", 0)
+            self.working.last_action  = w.get("last_action", "")
+            self.working.last_result  = w.get("last_result", "")
+
+            self.episodic = [
+                Episode(
+                    ts=e["ts"], tool=e["tool"],
+                    summary=e["summary"], ok=e["ok"],
+                )
+                for e in data.get("episodic", [])
+            ]
+            return True
+        except Exception:
+            return False
+
+    def checkpoint_clear(self) -> None:
+        """
+        체크포인트 삭제. done() 성공 시 호출 — 완료된 세션의 잔재 방지.
+        """
+        if not self._conn_address:
+            return
+        try:
+            path = self._checkpoint_path(self._conn_address)
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    def checkpoint_exists(self) -> bool:
+        """체크포인트 파일 존재 여부."""
+        if not self._conn_address:
+            return False
+        return self._checkpoint_path(self._conn_address).exists()
 
     def flush_if_dirty(self) -> None:
         """
