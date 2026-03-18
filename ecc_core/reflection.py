@@ -157,8 +157,11 @@ def generate_reflection(
     goal: str,
     failure_type: str,
     client: anthropic.Anthropic,
-    model: str = "claude-sonnet-4-6",
+    model: str = "",
 ) -> str:
+    if not model:
+        import os
+        model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
     """
     Reflexion 패턴 — 실패 이유를 언어로 생성.
     EscalationTracker 트리거 시 호출.

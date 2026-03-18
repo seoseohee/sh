@@ -244,7 +244,7 @@ class AgentLoop:
                     if _decision == ReplanDecision.RETRY_SAME_TASK:
                         _retry_count = _retry_count + 1 if reason == _last_retry_reason else 1
                         _last_retry_reason = reason
-                        if _retry_count >= 3:
+                        if _retry_count >= _env_int("ECC_MAX_RETRY", 3):
                             messages.append({"role": "user", "content":
                                 "[system] RETRY limit (3x). Switch strategy or call done(success=false)."})
                             tracer.note(f"retry_limit_exceeded: {reason[:60]}")

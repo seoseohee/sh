@@ -120,7 +120,7 @@ def run_subagent(
 
     while True:
         resp = client.messages.create(
-            model=_main_model(), max_tokens=4096,
+            model=_main_model(), max_tokens=_env_int("ECC_SUBAGENT_MAX_TOKENS", 4096),
             system=system, tools=tools, messages=messages,
         )
         messages.append({"role": "assistant", "content": resp.content})

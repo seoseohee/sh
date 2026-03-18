@@ -67,9 +67,9 @@ class BoardConnection:
         return ["-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                 "-o",f"ConnectTimeout={t}","-o","ServerAliveInterval=5","-o","ServerAliveCountMax=3"]
 
-    def __init__(self, host, user="root", port=22):
+    def __init__(self, host, user=None, port=22):
         self.host = host
-        self.user = user
+        self.user = user or os.environ.get("ECC_BOARD_USER", "root")
         self.port = port
         self._consecutive_failures = 0
 
