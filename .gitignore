@@ -1,3 +1,4 @@
+
 # Python
 __pycache__/
 *.py[cod]
@@ -33,3 +34,7 @@ build/
 .idea/
 *.swp
 *~
+
+__pycache__/
+*.pyc
+
