@@ -14,6 +14,8 @@ Changelog:
          에스컬레이션 임계보다 높은 수준의 반복 실패 감지 시
          LLM에 ask_user() 도구 호출을 명시적으로 지시하는 시스템 메시지 주입.
        [Improve C] classify_failure에 client 인자 전달 (LLM fallback 활성화).
+  v8 — [Timer] goal 입력 시각부터 done() 호출까지 경과 시간 측정.
+         콘솔 출력 및 goal_history에 elapsed_sec 필드로 저장.
 """
 
 import os
@@ -96,7 +98,10 @@ def _mid_session_consolidate_every() -> int:
 # 세션 종료 헬퍼
 # ─────────────────────────────────────────────────────────────
 
-def _record_session_end(tracer, active_goal, turn, success, conn, summary="") -> None:
+def _record_session_end(
+    tracer, active_goal, turn, success, conn,
+    summary="", elapsed_sec: float = 0.0,
+) -> None:
     tok_in, tok_out = tracer.get_token_totals()
     tracer.session_end(
         success=success,
@@ -106,6 +111,7 @@ def _record_session_end(tracer, active_goal, turn, success, conn, summary="") ->
         goal=active_goal, success=success, turns=turn,
         conn_address=conn.address if conn else "",
         tokens_in=tok_in, tokens_out=tok_out,
+        elapsed_sec=elapsed_sec,
     )
 
 
@@ -167,6 +173,9 @@ class AgentLoop:
 
     def run(self, goal: str, max_turns: int = 100):
         print(f"\n{'═'*60}\n  🎯 {goal[:80]}\n{'═'*60}")
+
+        # [Timer] goal 입력 시각 기록
+        _goal_start = time.monotonic()
 
         if self.conn and not self.conn.is_alive():
             print("  ⚠️  Previous connection lost..")
@@ -417,7 +426,6 @@ class AgentLoop:
                 for block in tool_blocks:
                     out = all_results.get(block.id, "[error] no result")
                     ann = _annotations.get(block.id, "")
-                    # 요약 적용 (어노테이션이 있는 경우 원본 + 어노테이션, 없으면 요약본)
                     summarized = summarize_tool_output(block.name, out)
                     tool_results.append({
                         "type": "tool_result",
@@ -442,6 +450,10 @@ class AgentLoop:
                     _last_consolidate_fail_count = current_fail_count
 
                 if executor.is_finished:
+                    # [Timer] 경과 시간 계산 및 출력
+                    _elapsed = time.monotonic() - _goal_start
+                    print(f"\n  ⏱  Goal completed in {_elapsed:.1f}s", flush=True)
+
                     state.messages = messages
                     self._session.save(state)
                     memory.checkpoint_clear()
@@ -457,7 +469,9 @@ class AgentLoop:
 
                     _record_session_end(
                         tracer=tracer, active_goal=active_goal, turn=turn,
-                        success=_session_success, conn=self.conn, summary=_session_summary,
+                        success=_session_success, conn=self.conn,
+                        summary=_session_summary,
+                        elapsed_sec=_elapsed,
                     )
                     break
 
@@ -475,9 +489,12 @@ class AgentLoop:
                     max_turns += _max_turns_step()
 
         except BaseException:
+            _elapsed = time.monotonic() - _goal_start
             _record_session_end(
                 tracer=tracer, active_goal=active_goal, turn=turn,
-                success=False, conn=self.conn, summary=f"exception after {turn} turns",
+                success=False, conn=self.conn,
+                summary=f"exception after {turn} turns",
+                elapsed_sec=_elapsed,
             )
             raise
 
