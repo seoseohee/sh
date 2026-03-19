@@ -1,55 +1,36 @@
 """
 ecc_core/reflection.py
 
-Reflexion pattern implementation (Shinn et al., NeurIPS 2023)
-
-Classify failure type and decide 3-way replanning destination:
-  RETRY_SAME_TASK   — retry with adjusted params (transient errors: connection/timeout)
-  REVISE_TASK_GRAPH — keep goal, revise sub-tasks (physical constraint discovered)
-  REPLAN_FROM_ROOT  — reinterpret goal, return to LLM Planner (structurally impossible)
-
-classify_failure()  : classify failure type from recent tool_result text
-generate_reflection(): call LLM to generate verbal failure analysis
-make_reflection_message(): create user message to inject into loop.py messages
-
 Changelog:
-  v2 — [Fix 2] generate_reflection() docstring 위치 버그 수정
-         기존: if not model 블록 다음에 docstring이 위치
-               → 문자열 리터럴로만 처리되어 help()/IDE 문서화가 깨짐
-         수정: docstring을 함수 첫 줄로 이동, model 기본값 처리는 그 아래로
+  v2 — [Fix 2] generate_reflection() docstring 위치 버그 수정.
+  v3 — [Improve C] FAILURE_ROUTING 정규식화 + LLM fallback 분류.
+         기존: 고정 문자열 부분 일치 (e.g. "speed: 0.0" 은 감지, "speed=0.00" 미감지).
+         수정:
+           1. 각 패턴을 re.compile()로 컴파일 → 변형 패턴 포괄.
+           2. 모든 키워드 매칭 실패 시 LLM이 실패 유형을 직접 분류.
+           3. LLM fallback은 client가 주어진 경우만 실행 (subagent 등 client 없는 호출 안전).
+           4. _classify_via_llm() 결과를 캐시 (동일 내용 반복 호출 방지).
 """
 
 import os
+import re
+import hashlib
 import anthropic
 from dataclasses import dataclass
 
 
-# ─────────────────────────────────────────────────────────────
-# Replan Decision constants + typed dataclass
-# ─────────────────────────────────────────────────────────────
-
 class ReplanDecision:
-    RETRY_SAME_TASK   = "retry"   # same tool, change parameters only
-    REVISE_TASK_GRAPH = "revise"  # keep goal, switch method
-    REPLAN_FROM_ROOT  = "replan"  # full strategy reset
+    RETRY_SAME_TASK   = "retry"
+    REVISE_TASK_GRAPH = "revise"
+    REPLAN_FROM_ROOT  = "replan"
 
 
 @dataclass
 class RecoveryDecision:
-    """Carry classified failure type + action hint together.
-
-    route: ReplanDecision constant (retry / revise / replan)
-    note:  concrete action guidance for the LLM
-    reason: verifier.py reason string (optional)
-    """
     route: str
     note: str
     reason: str = ""
 
-
-# ─────────────────────────────────────────────────────────────
-# verifier reason → RecoveryDecision mapping
-# ─────────────────────────────────────────────────────────────
 
 _VERIFIER_ROUTING: dict[str, RecoveryDecision] = {
     "execution_error": RecoveryDecision(
@@ -76,7 +57,6 @@ _VERIFIER_ROUTING: dict[str, RecoveryDecision] = {
 
 
 def route_from_verifier(verifier_reason: str) -> RecoveryDecision:
-    """verifier.py reason → RecoveryDecision."""
     return _VERIFIER_ROUTING.get(
         verifier_reason,
         RecoveryDecision(
@@ -87,32 +67,43 @@ def route_from_verifier(verifier_reason: str) -> RecoveryDecision:
     )
 
 
-# failure keyword → replan destination
-FAILURE_ROUTING: list[tuple[str, str]] = [
-    # ── transient connection/execution errors → retry
-    ("timeout after",        ReplanDecision.RETRY_SAME_TASK),
-    ("connection refused",   ReplanDecision.RETRY_SAME_TASK),
-    ("no route to host",     ReplanDecision.RETRY_SAME_TASK),
-    ("ssh_connect failed",   ReplanDecision.RETRY_SAME_TASK),
-    ("rc=-1",                ReplanDecision.RETRY_SAME_TASK),
+# ─────────────────────────────────────────────────────────────
+# [Improve C] 정규식 기반 FAILURE_ROUTING
+# ─────────────────────────────────────────────────────────────
+#
+# 기존 문제:
+#   ("speed: 0.0", ...) — "speed=0.0", "Speed: 0.00" 미감지
+#   ("command not found", ...) — "bash: XXX: command not found" 는 감지하지만
+#                                "not found" 단독은 미감지 → 이제 포괄
+#
+# 각 항목: (compiled_regex, ReplanDecision)
+# 순서 중요: 더 구체적인 패턴이 앞에 위치해야 함.
 
-    # ── physical constraint found → revise method
-    ("speed: 0.0",           ReplanDecision.REVISE_TASK_GRAPH),
-    ("speed=0.0",            ReplanDecision.REVISE_TASK_GRAPH),
-    ("no data",              ReplanDecision.REVISE_TASK_GRAPH),
-    ("0 publishers",         ReplanDecision.REVISE_TASK_GRAPH),
-    ("deadband",             ReplanDecision.REVISE_TASK_GRAPH),
-    ("below minimum",        ReplanDecision.REVISE_TASK_GRAPH),
-    ("min_erpm",             ReplanDecision.REVISE_TASK_GRAPH),
-    ("qos mismatch",         ReplanDecision.REVISE_TASK_GRAPH),
-    ("no new message",       ReplanDecision.REVISE_TASK_GRAPH),
+_FAILURE_ROUTING_RE: list[tuple[re.Pattern, str]] = [
+    # ── Retry (일시적 오류) ────────────────────────────────────
+    (re.compile(r"timeout\s+after|timed\s+out", re.I),           ReplanDecision.RETRY_SAME_TASK),
+    (re.compile(r"connection\s+refused",        re.I),           ReplanDecision.RETRY_SAME_TASK),
+    (re.compile(r"no\s+route\s+to\s+host",      re.I),           ReplanDecision.RETRY_SAME_TASK),
+    (re.compile(r"ssh_connect\s+failed",        re.I),           ReplanDecision.RETRY_SAME_TASK),
+    (re.compile(r"\brc=-1\b",                   re.I),           ReplanDecision.RETRY_SAME_TASK),
+    (re.compile(r"broken\s+pipe|connection\s+reset", re.I),      ReplanDecision.RETRY_SAME_TASK),
 
-    # ── structurally impossible → full strategy reset
-    ("command not found",    ReplanDecision.REPLAN_FROM_ROOT),
-    ("not installed",        ReplanDecision.REPLAN_FROM_ROOT),
-    ("no such file",         ReplanDecision.REPLAN_FROM_ROOT),
-    ("permission denied",    ReplanDecision.REPLAN_FROM_ROOT),
-    ("exit code 127",        ReplanDecision.REPLAN_FROM_ROOT),
+    # ── Revise (물리적 제약 / QoS / 데이터 없음) ─────────────
+    (re.compile(r"speed\s*[=:]\s*0+\.?0*\b",   re.I),           ReplanDecision.REVISE_TASK_GRAPH),
+    (re.compile(r"\bno\s+data\b",               re.I),           ReplanDecision.REVISE_TASK_GRAPH),
+    (re.compile(r"\b0\s+publishers?\b",         re.I),           ReplanDecision.REVISE_TASK_GRAPH),
+    (re.compile(r"\bdeadband\b",                re.I),           ReplanDecision.REVISE_TASK_GRAPH),
+    (re.compile(r"below\s+minimum|min_erpm",    re.I),           ReplanDecision.REVISE_TASK_GRAPH),
+    (re.compile(r"qos\s+mismatch|incompatible\s+qos", re.I),     ReplanDecision.REVISE_TASK_GRAPH),
+    (re.compile(r"no\s+new\s+message",          re.I),           ReplanDecision.REVISE_TASK_GRAPH),
+    (re.compile(r"erpm.*0\b|0.*erpm",           re.I),           ReplanDecision.REVISE_TASK_GRAPH),
+
+    # ── Replan (구조적 불가능) ────────────────────────────────
+    (re.compile(r"command\s+not\s+found|not\s+installed", re.I), ReplanDecision.REPLAN_FROM_ROOT),
+    (re.compile(r"no\s+such\s+file|file\s+not\s+found",   re.I), ReplanDecision.REPLAN_FROM_ROOT),
+    (re.compile(r"permission\s+denied|operation\s+not\s+permitted", re.I), ReplanDecision.REPLAN_FROM_ROOT),
+    (re.compile(r"exit\s+code\s+127",           re.I),           ReplanDecision.REPLAN_FROM_ROOT),
+    (re.compile(r"import\s+error|module\s+not\s+found",    re.I), ReplanDecision.REPLAN_FROM_ROOT),
 ]
 
 _ACTION_HINT: dict[str, str] = {
@@ -131,25 +122,74 @@ _ACTION_HINT: dict[str, str] = {
     ),
 }
 
+# LLM fallback 결과 캐시 (동일 내용 반복 호출 방지)
+_llm_classify_cache: dict[str, str] = {}
 
-# ─────────────────────────────────────────────────────────────
-# Failure classification
-# ─────────────────────────────────────────────────────────────
 
-def classify_failure(recent_results: list[str]) -> str:
-    """Classify failure type from recent tool_result text.
+def classify_failure(
+    recent_results: list[str],
+    client: "anthropic.Anthropic | None" = None,
+) -> str:
+    """실패 유형을 정규식으로 분류. 미감지 시 LLM fallback.
 
-    No match → REPLAN_FROM_ROOT (unknown, LLM decides).
+    [Improve C]
+      - 정규식으로 변형 패턴 포괄 (예: speed=0.0, Speed: 0.00 모두 감지)
+      - 모든 패턴 미감지 시 client가 있으면 LLM으로 의미 기반 분류
+      - LLM 호출 결과는 캐시에 저장해 반복 호출 방지
     """
     combined = " ".join(r.lower() for r in recent_results[-4:])
-    for keyword, decision in FAILURE_ROUTING:
-        if keyword in combined:
+
+    for pattern, decision in _FAILURE_ROUTING_RE:
+        if pattern.search(combined):
             return decision
+
+    # LLM fallback
+    if client is not None:
+        return _classify_via_llm(combined, client)
+
     return ReplanDecision.REPLAN_FROM_ROOT
 
 
+def _classify_via_llm(text: str, client: anthropic.Anthropic) -> str:
+    """키워드 매칭 실패 시 LLM이 실패 유형 직접 분류.
+
+    캐시 키: 텍스트의 MD5 (내용 동일 시 재호출 방지).
+    """
+    cache_key = hashlib.md5(text[:500].encode()).hexdigest()
+    if cache_key in _llm_classify_cache:
+        return _llm_classify_cache[cache_key]
+
+    model = os.environ.get("ECC_COMPACT_MODEL",
+            os.environ.get("ECC_MODEL", "claude-sonnet-4-6"))
+    prompt = (
+        "Classify the following embedded board agent failure into exactly one category.\n\n"
+        f"Failure text:\n{text[:400]}\n\n"
+        "Categories (output ONLY the category name, nothing else):\n"
+        f"  {ReplanDecision.RETRY_SAME_TASK}  — transient: timeout, SSH drop, rate limit\n"
+        f"  {ReplanDecision.REVISE_TASK_GRAPH} — physical constraint: speed=0, deadband, no data\n"
+        f"  {ReplanDecision.REPLAN_FROM_ROOT}  — structural: missing package, permission denied\n"
+    )
+    try:
+        resp = client.messages.create(
+            model=model, max_tokens=20,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = (resp.content[0].text if resp.content else "").strip().lower()
+        if ReplanDecision.RETRY_SAME_TASK in raw:
+            result = ReplanDecision.RETRY_SAME_TASK
+        elif ReplanDecision.REVISE_TASK_GRAPH in raw:
+            result = ReplanDecision.REVISE_TASK_GRAPH
+        else:
+            result = ReplanDecision.REPLAN_FROM_ROOT
+    except Exception:
+        result = ReplanDecision.REPLAN_FROM_ROOT
+
+    _llm_classify_cache[cache_key] = result
+    return result
+
+
 # ─────────────────────────────────────────────────────────────
-# Reflection generation (LLM call)
+# Reflection generation
 # ─────────────────────────────────────────────────────────────
 
 def generate_reflection(
@@ -159,20 +199,10 @@ def generate_reflection(
     client: anthropic.Anthropic,
     model: str = "",
 ) -> str:
-    """Reflexion pattern — generate verbal failure reason.
-
-    Called when EscalationTracker fires.
-    Result injected into messages is seen by LLM next turn.
-
-    [Fix 2] docstring을 함수 첫 줄로 이동.
-    기존 코드에서는 `if not model:` 블록 다음에 docstring이 위치해
-    Python이 이를 docstring이 아닌 문자열 리터럴로 처리했음.
-    """
-    # [Fix 2] model 기본값 처리 — docstring 이후로 이동
+    """Reflexion pattern — verbal failure reason 생성."""
     if not model:
         model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
 
-    # Use only last 6 messages (cost saving)
     recent = messages[-6:] if len(messages) >= 6 else messages
 
     system = (
@@ -195,9 +225,7 @@ def generate_reflection(
 
     try:
         resp = client.messages.create(
-            model=model,
-            max_tokens=250,
-            system=system,
+            model=model, max_tokens=250, system=system,
             messages=recent + [{"role": "user", "content": prompt}],
         )
         return resp.content[0].text if resp.content else "(reflection unavailable)"
@@ -205,15 +233,7 @@ def generate_reflection(
         return f"(reflection error: {e})"
 
 
-# ─────────────────────────────────────────────────────────────
-# Create message for injection into messages
-# ─────────────────────────────────────────────────────────────
-
 def make_reflection_message(reflection_text: str, decision: str) -> dict:
-    """Inject reflection result as user message into loop.py messages.
-
-    Agent sees this next turn and takes a different approach.
-    """
     action = {
         ReplanDecision.RETRY_SAME_TASK:   "Retry with adjusted parameters.",
         ReplanDecision.REVISE_TASK_GRAPH: "Revise your approach — keep the goal, change the method.",

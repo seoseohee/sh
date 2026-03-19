@@ -1,35 +1,19 @@
 """
 ecc_core/loop.py — AgentLoop (thin orchestrator)
 
-v4 separation:
-  escalation.py  — EscalationTracker
-  session.py     — SessionManager, SessionState
-  dispatcher.py  — ToolDispatcher, SubagentRole, run_subagent
-
-Responsibilities:
-  - LLM API calls (Anthropic client)
-  - turn loop + escalation management
-  - verifier feedback annotation injection
-  - three-module orchestration
-
-Backward-compatible re-exports:
-  SubagentRole, run_subagent — importable from this file too.
-
 Changelog:
-  v5 — [Fix 1] record_goal 누락 수정
-         기존: done(success=True) 경로만 기록됨
-         수정: done(success=False), max_turns 초과, KeyboardInterrupt 등
-               모든 세션 종료 경로에서 record_goal 호출
-         구현: _record_session_end() 헬퍼로 중앙화
-  v6 — [Fix] except Exception → except BaseException
-         기존: KeyboardInterrupt가 Exception 서브클래스가 아니므로
-               Ctrl+C 시 _record_session_end() 미호출, history.jsonl 미기록
-         수정: except BaseException으로 변경 → KeyboardInterrupt도 포함
-       [Fix] set_running() 호출 추가
-         기존: session.py의 _current_state_snapshot()이 None 반환
-               → KeyboardInterrupt 시 partial-save 무동작
-         수정: 매 턴 turn += 1 직전에 self._session.set_running() 호출
-               → session.py 패치와 연동되어 partial-save 정상 동작
+  v5 — [Fix 1] record_goal 누락 수정 (모든 종료 경로 기록)
+  v6 — [Fix] except BaseException, set_running() 추가
+  v7 — [Improve A] 툴 결과를 messages에 넣기 전 summarize_tool_output() 적용.
+         원본 전체 텍스트 대신 툴별 요약본이 컨텍스트에 누적됨.
+       [Improve E] 세션 중 에피소딕→시맨틱 통합.
+         실패 에피소드 5개 누적마다 consolidate_episodic() 호출해
+         같은 세션 내 반복 실수를 즉시 failed 네임스페이스에 저장.
+         ECC_MID_SESSION_CONSOLIDATE_EVERY (기본 5)로 조정.
+       [Improve G] should_ask_user() 메타인지 라우팅.
+         에스컬레이션 임계보다 높은 수준의 반복 실패 감지 시
+         LLM에 ask_user() 도구 호출을 명시적으로 지시하는 시스템 메시지 주입.
+       [Improve C] classify_failure에 client 인자 전달 (LLM fallback 활성화).
 """
 
 import os
@@ -38,42 +22,39 @@ import time
 import anthropic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .connection  import BoardConnection, BoardDiscovery
-from .todo        import TodoManager
-from .executor    import ToolExecutor
-from .compactor   import should_compact, compact
-from .prompt      import build_system_prompt
-from .tool_schemas import get_tool_definitions
-from .memory      import ECCMemory
-from .tracer      import Tracer
-from .reflection  import (classify_failure, generate_reflection,
-                          make_reflection_message, route_from_verifier, ReplanDecision)
-from .observation import collect_observation
-from .verifier    import verify_execution, verify_motion, parse_error_feedback
+from .connection    import BoardConnection, BoardDiscovery
+from .todo          import TodoManager
+from .executor      import ToolExecutor
+from .compactor     import should_compact, compact, summarize_tool_output
+from .prompt        import build_system_prompt
+from .tool_schemas  import get_tool_definitions
+from .memory        import ECCMemory
+from .tracer        import Tracer
+from .reflection    import (classify_failure, generate_reflection,
+                             make_reflection_message, route_from_verifier, ReplanDecision)
+from .observation   import collect_observation
+from .verifier      import verify_execution, verify_motion, parse_error_feedback
 from .escalation    import EscalationTracker
 from .session       import SessionManager
-from .dispatcher    import ToolDispatcher, SubagentRole, run_subagent  # noqa: F401 (re-export)
+from .dispatcher    import ToolDispatcher, SubagentRole, run_subagent  # noqa: F401
 from .consolidation import consolidate_episodic
 from .goal_history  import record_goal
 
 
 # ─────────────────────────────────────────────────────────────
-# Environment variable helpers
+# Env helpers
 # ─────────────────────────────────────────────────────────────
 
 def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, default))
-    except (ValueError, TypeError):
-        return default
+    try: return int(os.environ.get(key, default))
+    except (ValueError, TypeError): return default
 
 def _main_model() -> str:
     return os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
 
 def _escalate_model() -> str:
     env = os.environ.get("ECC_ESCALATE_MODEL")
-    if env:
-        return env
+    if env: return env
     main = _main_model()
     return main.replace("sonnet", "opus") if "sonnet" in main else main
 
@@ -88,11 +69,9 @@ def _thinking_budget() -> int:
 
 def _supports_adaptive(model: str) -> bool:
     env = os.environ.get("ECC_ADAPTIVE_MODELS")
-    if env:
-        return any(m.strip() in model for m in env.split(","))
+    if env: return any(m.strip() in model for m in env.split(","))
     m = re.search(r"(\d+)[\.-](\d+)", model)
-    if m:
-        return (int(m.group(1)), int(m.group(2))) >= (4, 6)
+    if m: return (int(m.group(1)), int(m.group(2))) >= (4, 6)
     return False
 
 def _thinking_params(model: str) -> dict:
@@ -108,31 +87,25 @@ def _conn_check_interval() -> int:
 def _max_turns_step() -> int:
     return _env_int("ECC_MAX_TURNS_STEP", 50)
 
+def _mid_session_consolidate_every() -> int:
+    """[Improve E] 실패 에피소드 몇 개마다 중간 통합할지. ECC_MID_SESSION_CONSOLIDATE_EVERY."""
+    return _env_int("ECC_MID_SESSION_CONSOLIDATE_EVERY", 5)
+
 
 # ─────────────────────────────────────────────────────────────
-# [Fix 1] 세션 종료 헬퍼 — 모든 종료 경로 중앙화
+# 세션 종료 헬퍼
 # ─────────────────────────────────────────────────────────────
 
-def _record_session_end(
-    tracer:       "Tracer",
-    active_goal:  str,
-    turn:         int,
-    success:      bool,
-    conn:         "BoardConnection | None",
-    summary:      str = "",
-) -> None:
+def _record_session_end(tracer, active_goal, turn, success, conn, summary="") -> None:
     tok_in, tok_out = tracer.get_token_totals()
     tracer.session_end(
         success=success,
         summary=summary or (f"done() after {turn} turns" if success else f"failed after {turn} turns"),
     )
     record_goal(
-        goal=active_goal,
-        success=success,
-        turns=turn,
+        goal=active_goal, success=success, turns=turn,
         conn_address=conn.address if conn else "",
-        tokens_in=tok_in,
-        tokens_out=tok_out,
+        tokens_in=tok_in, tokens_out=tok_out,
     )
 
 
@@ -143,12 +116,12 @@ def _record_session_end(
 class AgentLoop:
 
     def __init__(self, verbose: bool = False):
-        self.verbose    = verbose
-        self.client     = anthropic.Anthropic()
+        self.verbose  = verbose
+        self.client   = anthropic.Anthropic()
         self.conn: BoardConnection | None = None
-        self._session   = SessionManager()
+        self._session = SessionManager()
 
-    # ── cli.py backward-compat properties ──────────────────────────────
+    # ── cli.py 하위 호환 프로퍼티 ──────────────────────────────
 
     @property
     def _session_messages(self) -> list[dict]:
@@ -190,7 +163,7 @@ class AgentLoop:
     def _session_memory(self, v):
         self._session._saved_memory = v
 
-    # ── Main loop ──────────────────────────────────────────────
+    # ── 메인 루프 ──────────────────────────────────────────────
 
     def run(self, goal: str, max_turns: int = 100):
         print(f"\n{'═'*60}\n  🎯 {goal[:80]}\n{'═'*60}")
@@ -212,15 +185,11 @@ class AgentLoop:
         disp   = ToolDispatcher(self)
         tracer = Tracer(goal=active_goal[:80])
 
-        # ── Checkpoint restore ──────────────────────────────────
         if not is_followup and memory.checkpoint_exists():
             restored = memory.checkpoint_load()
             if restored and memory.working.goal:
-                print(
-                    f"\n  ♻️  Checkpoint restored — previous turn={memory.working.turn}"
-                    f", step='{memory.working.current_step[:40]}'",
-                    flush=True,
-                )
+                print(f"\n  ♻️  Checkpoint restored — turn={memory.working.turn}"
+                      f", step='{memory.working.current_step[:40]}'", flush=True)
                 messages.insert(0, {
                     "role": "user",
                     "content": (
@@ -245,11 +214,12 @@ class AgentLoop:
         turn               = 0
         _retry_count       = 0
         _last_retry_reason = ""
+        _session_success   = False
+        _session_summary   = ""
 
-        _session_success = False
-        _session_summary = ""
+        # [Improve E] 중간 통합 추적 카운터
+        _last_consolidate_fail_count = 0
 
-        # [v6 Fix] except BaseException으로 KeyboardInterrupt 포함
         try:
             while True:
 
@@ -272,7 +242,7 @@ class AgentLoop:
                     + (f"\n\n{todos.format_nag()}" if todos.format_nag() else "")
                 )
 
-                # ── LLM call ─────────────────────────────────────
+                # ── LLM 호출 ─────────────────────────────────────
                 try:
                     escalate, reason = escalation.should_escalate()
                     turn_model       = _escalate_model() if escalate else model
@@ -284,7 +254,8 @@ class AgentLoop:
                     )
 
                     if escalate:
-                        _decision   = classify_failure(escalation.get_recent_results())
+                        # [Improve C] classify_failure에 client 전달 → LLM fallback 활성화
+                        _decision   = classify_failure(escalation.get_recent_results(), self.client)
                         _reflection = generate_reflection(messages, active_goal, _decision,
                                                           self.client, model=model)
                         messages.append(make_reflection_message(_reflection, _decision))
@@ -302,6 +273,23 @@ class AgentLoop:
                         else:
                             _retry_count = 0
                             _last_retry_reason = ""
+
+                    # [Improve G] 메타인지 판단 — ask_user 라우팅
+                    ask_user_needed, ask_user_reason = escalation.should_ask_user()
+                    if ask_user_needed:
+                        print(f"\n  🤔 Meta-cognition: ask_user recommended — {ask_user_reason}", flush=True)
+                        tracer.note(f"meta_ask_user: {ask_user_reason[:80]}")
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[system] Meta-cognitive signal: {ask_user_reason}\n"
+                                "You should call ask_user() to report the situation and ask for direction "
+                                "rather than continuing the current approach. "
+                                "Explain clearly what you have tried and what the obstacle is."
+                            )
+                        })
+                        # 중복 주입 방지: sig_counter 리셋 (ask_user 호출 기회 1회 부여)
+                        escalation._sig_counter.clear()
 
                     create_kwargs = dict(
                         model=turn_model, max_tokens=turn_max_tokens,
@@ -363,11 +351,11 @@ class AgentLoop:
                         "[system] Call done() or continue working toward the goal."})
                     continue
 
-                # ── Tool execution ────────────────────────────────
+                # ── 툴 실행 ───────────────────────────────────────
                 tool_blocks = [b for b in resp.content if b.type == "tool_use"]
                 all_results = disp.dispatch(tool_blocks, executor, memory, messages)
 
-                # ── Verifier feedback annotation ──────────────────
+                # ── Verifier 피드백 어노테이션 ────────────────────
                 _annotations: dict[str, str] = {}
                 for block in tool_blocks:
                     out = all_results.get(block.id, "")
@@ -424,15 +412,34 @@ class AgentLoop:
                 if _in_prog:
                     memory.working.current_step = _in_prog[0].content[:100]
 
+                # [Improve A] 툴 결과를 messages에 넣기 전 요약 적용
                 tool_results = []
                 for block in tool_blocks:
                     out = all_results.get(block.id, "[error] no result")
                     ann = _annotations.get(block.id, "")
-                    tool_results.append({"type": "tool_result",
-                                         "tool_use_id": block.id,
-                                         "content": out + ann})
+                    # 요약 적용 (어노테이션이 있는 경우 원본 + 어노테이션, 없으면 요약본)
+                    summarized = summarize_tool_output(block.name, out)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": summarized + ann,
+                    })
                 if tool_results:
                     messages.append({"role": "user", "content": tool_results})
+
+                # [Improve E] 세션 중 에피소딕 → 시맨틱 통합
+                current_fail_count = sum(1 for e in memory.episodic if not e.ok)
+                consolidate_every  = _mid_session_consolidate_every()
+                if (consolidate_every > 0
+                        and current_fail_count >= consolidate_every
+                        and current_fail_count - _last_consolidate_fail_count >= consolidate_every):
+                    _result = consolidate_episodic(memory, active_goal, self.client, min_failures=1)
+                    if _result["failed"] + _result["constraints"] > 0:
+                        tracer.note(
+                            f"mid_session_consolidate: "
+                            f"failed={_result['failed']} constraints={_result['constraints']}"
+                        )
+                    _last_consolidate_fail_count = current_fail_count
 
                 if executor.is_finished:
                     state.messages = messages
@@ -441,10 +448,7 @@ class AgentLoop:
 
                     consolidate_episodic(memory, active_goal, self.client)
 
-                    _done_block = next(
-                        (b for b in tool_blocks if b.name == "done"),
-                        None,
-                    )
+                    _done_block   = next((b for b in tool_blocks if b.name == "done"), None)
                     _done_success = _done_block.input.get("success", False) if _done_block else False
                     _done_summary = _done_block.input.get("summary", "") if _done_block else ""
 
@@ -452,12 +456,8 @@ class AgentLoop:
                     _session_summary = _done_summary
 
                     _record_session_end(
-                        tracer=tracer,
-                        active_goal=active_goal,
-                        turn=turn,
-                        success=_session_success,
-                        conn=self.conn,
-                        summary=_session_summary,
+                        tracer=tracer, active_goal=active_goal, turn=turn,
+                        success=_session_success, conn=self.conn, summary=_session_summary,
                     )
                     break
 
@@ -466,7 +466,6 @@ class AgentLoop:
 
                 memory.working.turn = turn
                 memory.checkpoint_save()
-                # [v6 Fix] KeyboardInterrupt partial-save를 위해 매 턴 상태 갱신
                 self._session.set_running(messages, active_goal, todos, executor, memory)
                 turn += 1
                 if turn >= max_turns:
@@ -476,32 +475,24 @@ class AgentLoop:
                     max_turns += _max_turns_step()
 
         except BaseException:
-            # [v6 Fix] except BaseException: KeyboardInterrupt 포함 모든 비정상 종료 기록
-            # 기존 except Exception은 KeyboardInterrupt를 잡지 못해 history.jsonl 미기록
             _record_session_end(
-                tracer=tracer,
-                active_goal=active_goal,
-                turn=turn,
-                success=False,
-                conn=self.conn,
-                summary=f"exception after {turn} turns",
+                tracer=tracer, active_goal=active_goal, turn=turn,
+                success=False, conn=self.conn, summary=f"exception after {turn} turns",
             )
             raise
 
     def _save_partial_session(self):
-        """Called by cli.py on KeyboardInterrupt."""
         state = self._session._current_state_snapshot()
         if state:
             self._session.save_partial(*state)
 
     @staticmethod
     def _is_followup(goal: str, has_session: bool) -> bool:
-        """Backward compat. Delegates to SessionManager.is_followup()."""
         return SessionManager.is_followup(goal, has_session)
 
 
 # ─────────────────────────────────────────────────────────────
-# Output helpers
+# 출력 헬퍼
 # ─────────────────────────────────────────────────────────────
 
 def _print_thinking(text: str) -> None:
