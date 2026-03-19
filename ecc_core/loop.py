@@ -14,6 +14,13 @@ Responsibilities:
 
 Backward-compatible re-exports:
   SubagentRole, run_subagent — importable from this file too.
+
+Changelog:
+  v5 — [Fix 1] record_goal 누락 수정
+         기존: done(success=True) 경로만 기록됨
+         수정: done(success=False), max_turns 초과, KeyboardInterrupt 등
+               모든 세션 종료 경로에서 record_goal 호출
+         구현: _record_session_end() 헬퍼로 중앙화
 """
 
 import os
@@ -83,6 +90,56 @@ def _thinking_params(model: str) -> dict:
     return {"type": "adaptive"} if _supports_adaptive(model) else \
            {"type": "enabled", "budget_tokens": _thinking_budget()}
 
+def _rate_limit_wait() -> int:
+    """RateLimitError 대기 시간(초). ECC_RATE_LIMIT_WAIT로 오버라이드."""
+    return _env_int("ECC_RATE_LIMIT_WAIT", 60)
+
+def _conn_check_interval() -> int:
+    """SSH 연결 체크 주기(턴). ECC_CONN_CHECK_INTERVAL로 오버라이드."""
+    return _env_int("ECC_CONN_CHECK_INTERVAL", 10)
+
+def _max_turns_step() -> int:
+    """최대 턴 초과 시 확장량. ECC_MAX_TURNS_STEP으로 오버라이드."""
+    return _env_int("ECC_MAX_TURNS_STEP", 50)
+
+
+# ─────────────────────────────────────────────────────────────
+# [Fix 1] 세션 종료 헬퍼 — 모든 종료 경로 중앙화
+# ─────────────────────────────────────────────────────────────
+
+def _record_session_end(
+    tracer:       "Tracer",
+    active_goal:  str,
+    turn:         int,
+    success:      bool,
+    conn:         "BoardConnection | None",
+    summary:      str = "",
+) -> None:
+    """
+    모든 세션 종료 경로에서 tracer + record_goal을 일관되게 호출.
+
+    기존 문제:
+      - done(success=True) 경로만 record_goal 호출
+      - done(success=False), max_turns 초과, KeyboardInterrupt 등은 미기록
+
+    수정:
+      - run() 내의 모든 break / return 경로에서 이 함수를 호출
+      - success=False일 때도 history.jsonl에 기록됨
+    """
+    tok_in, tok_out = tracer.get_token_totals()
+    tracer.session_end(
+        success=success,
+        summary=summary or (f"done() after {turn} turns" if success else f"failed after {turn} turns"),
+    )
+    record_goal(
+        goal=active_goal,
+        success=success,
+        turns=turn,
+        conn_address=conn.address if conn else "",
+        tokens_in=tok_in,
+        tokens_out=tok_out,
+    )
+
 
 # ─────────────────────────────────────────────────────────────
 # AgentLoop
@@ -95,9 +152,6 @@ class AgentLoop:
         self.client     = anthropic.Anthropic()
         self.conn: BoardConnection | None = None
         self._session   = SessionManager()
-        # NOTE: _session_messages / _session_goal 등은 아래 @property로 정의됨.
-        # __init__ 안에서 property()를 인스턴스에 할당하면 클래스 레벨 descriptor가
-        # 가려지지 않으므로 여기서는 할당하지 않는다.
 
     # ── cli.py backward-compat properties ──────────────────────────────
 
@@ -150,23 +204,20 @@ class AgentLoop:
             print("  ⚠️  Previous connection lost..")
             self.conn = None
 
-        # Session init (SessionManager)
         state, is_followup = self._session.init_session(goal, self.conn, self.verbose)
         if is_followup:
             print(f"  🔁 Resuming previous session ({len(self._session.saved_messages)} messages)", flush=True)
 
-        messages  = state.messages
-        todos     = state.todos
-        executor  = state.executor
-        memory    = state.memory
+        messages    = state.messages
+        todos       = state.todos
+        executor    = state.executor
+        memory      = state.memory
         active_goal = state.goal
 
-        # Dispatcher
-        disp = ToolDispatcher(self)
+        disp   = ToolDispatcher(self)
+        tracer = Tracer(goal=active_goal[:80])
 
-        tracer     = Tracer(goal=active_goal[:80])
-
-        # ── Checkpoint restore (after SSH disconnect) ──────────────
+        # ── Checkpoint restore ──────────────────────────────────
         if not is_followup and memory.checkpoint_exists():
             restored = memory.checkpoint_load()
             if restored and memory.working.goal:
@@ -188,7 +239,6 @@ class AgentLoop:
                     )
                 })
                 tracer.note(f"checkpoint_restored: turn={memory.working.turn}")
-        # ─────────────────────────────────────────────────────────
 
         system     = build_system_prompt()
         model      = _main_model()
@@ -201,225 +251,250 @@ class AgentLoop:
         _retry_count       = 0
         _last_retry_reason = ""
 
-        while True:
+        # [Fix 1] 세션 결과 추적 — 루프 정상 종료 / 비정상 종료 모두 처리
+        _session_success = False
+        _session_summary = ""
 
-            # Context compression
-            if should_compact(messages):
-                facts    = memory.get_persistent_facts()
-                messages = compact(messages, active_goal, todos.format_for_llm(),
-                                   self.client, persistent_facts=facts)
-                tracer.note("context compacted")
+        try:
+            while True:
 
-            conn_status = (
-                f"[Connected: {self.conn.address}]" if self.conn else "[Not connected]"
-            )
-            # v4: use current tool context as query to inject only relevant memory
-            _mem_query = f"{active_goal} {memory.working.current_step} {memory.working.last_action}"
-            system_with_state = (
-                system
-                + f"\n\nCurrent connection: {conn_status}"
-                + (f"\n\n{memory.to_system_context(query=_mem_query)}"
-                   if memory.to_system_context(query=_mem_query) else "")
-                + (f"\n\n{todos.format_nag()}" if todos.format_nag() else "")
-            )
-
-            # ── LLM call ───────────────────────────────────────
-            try:
-                escalate, reason = escalation.should_escalate()
-                turn_model       = _escalate_model() if escalate else model
-                turn_thinking    = escalate or _thinking_enabled()
-                turn_max_tokens  = (
-                    max(max_tokens, _thinking_budget() + 4096)
-                    if (turn_thinking and not _supports_adaptive(turn_model))
-                    else max_tokens
-                )
-
-                if escalate:
-                    _decision   = classify_failure(escalation.get_recent_results())
-                    _reflection = generate_reflection(messages, active_goal, _decision,
-                                                      self.client, model=model)
-                    messages.append(make_reflection_message(_reflection, _decision))
-                    tracer.reflection(_decision, _reflection)
-                    print(f"\n  🔺 Escalate → {turn_model} ({reason})", flush=True)
-
-                    if _decision == ReplanDecision.RETRY_SAME_TASK:
-                        _retry_count = _retry_count + 1 if reason == _last_retry_reason else 1
-                        _last_retry_reason = reason
-                        if _retry_count >= _env_int("ECC_MAX_RETRY", 3):
-                            messages.append({"role": "user", "content":
-                                "[system] RETRY limit (3x). Switch strategy or call done(success=false)."})
-                            tracer.note(f"retry_limit_exceeded: {reason[:60]}")
-                            _retry_count = 0
-                    else:
-                        _retry_count = 0
-                        _last_retry_reason = ""
-
-                create_kwargs = dict(
-                    model=turn_model, max_tokens=turn_max_tokens,
-                    system=system_with_state, tools=get_tool_definitions(), messages=messages,
-                )
-                if turn_thinking:
-                    create_kwargs["thinking"] = _thinking_params(turn_model)
-
-                t0     = time.monotonic()
-                resp   = self.client.messages.create(**create_kwargs)
-                llm_ms = int((time.monotonic() - t0) * 1000)
-
-                _usage = getattr(resp, "usage", None)
-                tracer.llm_call(
-                    model=turn_model,
-                    tokens_in=getattr(_usage, "input_tokens", 0) if _usage else 0,
-                    tokens_out=getattr(_usage, "output_tokens", 0) if _usage else 0,
-                    duration_ms=llm_ms, escalated=escalate,
-                )
-                if escalate:
-                    escalation.reset_escalation()
-
-            except anthropic.RateLimitError:
-                wait = 60
-                print(f"\n  ⏳ Rate limit — {wait}s wait...", flush=True)
-                time.sleep(wait)
-                continue
-
-            except anthropic.BadRequestError as e:
-                err = str(e).lower()
-                if any(kw in err for kw in ("context", "too long", "too many token",
-                                             "input length", "prompt_too_long")):
+                # Context compression
+                if should_compact(messages):
                     facts    = memory.get_persistent_facts()
                     messages = compact(messages, active_goal, todos.format_for_llm(),
                                        self.client, persistent_facts=facts)
-                    tracer.note("context_overflow_compacted")
+                    tracer.note("context compacted")
+
+                conn_status = (
+                    f"[Connected: {self.conn.address}]" if self.conn else "[Not connected]"
+                )
+                _mem_query = f"{active_goal} {memory.working.current_step} {memory.working.last_action}"
+                system_with_state = (
+                    system
+                    + f"\n\nCurrent connection: {conn_status}"
+                    + (f"\n\n{memory.to_system_context(query=_mem_query)}"
+                       if memory.to_system_context(query=_mem_query) else "")
+                    + (f"\n\n{todos.format_nag()}" if todos.format_nag() else "")
+                )
+
+                # ── LLM call ─────────────────────────────────────
+                try:
+                    escalate, reason = escalation.should_escalate()
+                    turn_model       = _escalate_model() if escalate else model
+                    turn_thinking    = escalate or _thinking_enabled()
+                    turn_max_tokens  = (
+                        max(max_tokens, _thinking_budget() + 4096)
+                        if (turn_thinking and not _supports_adaptive(turn_model))
+                        else max_tokens
+                    )
+
+                    if escalate:
+                        _decision   = classify_failure(escalation.get_recent_results())
+                        _reflection = generate_reflection(messages, active_goal, _decision,
+                                                          self.client, model=model)
+                        messages.append(make_reflection_message(_reflection, _decision))
+                        tracer.reflection(_decision, _reflection)
+                        print(f"\n  🔺 Escalate → {turn_model} ({reason})", flush=True)
+
+                        if _decision == ReplanDecision.RETRY_SAME_TASK:
+                            _retry_count = _retry_count + 1 if reason == _last_retry_reason else 1
+                            _last_retry_reason = reason
+                            if _retry_count >= _env_int("ECC_MAX_RETRY", 3):
+                                messages.append({"role": "user", "content":
+                                    "[system] RETRY limit (3x). Switch strategy or call done(success=false)."})
+                                tracer.note(f"retry_limit_exceeded: {reason[:60]}")
+                                _retry_count = 0
+                        else:
+                            _retry_count = 0
+                            _last_retry_reason = ""
+
+                    create_kwargs = dict(
+                        model=turn_model, max_tokens=turn_max_tokens,
+                        system=system_with_state, tools=get_tool_definitions(), messages=messages,
+                    )
+                    if turn_thinking:
+                        create_kwargs["thinking"] = _thinking_params(turn_model)
+
+                    t0     = time.monotonic()
+                    resp   = self.client.messages.create(**create_kwargs)
+                    llm_ms = int((time.monotonic() - t0) * 1000)
+
+                    _usage = getattr(resp, "usage", None)
+                    tracer.llm_call(
+                        model=turn_model,
+                        tokens_in=getattr(_usage, "input_tokens", 0) if _usage else 0,
+                        tokens_out=getattr(_usage, "output_tokens", 0) if _usage else 0,
+                        duration_ms=llm_ms, escalated=escalate,
+                    )
+                    if escalate:
+                        escalation.reset_escalation()
+
+                except anthropic.RateLimitError:
+                    wait = _rate_limit_wait()
+                    print(f"\n  ⏳ Rate limit — {wait}s wait...", flush=True)
+                    time.sleep(wait)
                     continue
-                raise
 
-            # Prevent duplicate append
-            last_asst = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
-            if last_asst and last_asst["content"] is resp.content:
-                continue
-            messages.append({"role": "assistant", "content": resp.content})
+                except anthropic.BadRequestError as e:
+                    err = str(e).lower()
+                    if any(kw in err for kw in ("context", "too long", "too many token",
+                                                 "input length", "prompt_too_long")):
+                        facts    = memory.get_persistent_facts()
+                        messages = compact(messages, active_goal, todos.format_for_llm(),
+                                           self.client, persistent_facts=facts)
+                        tracer.note("context_overflow_compacted")
+                        continue
+                    raise
 
-            # Output
-            seen_text = False
-            for block in resp.content:
-                if block.type == "thinking" and block.thinking.strip():
-                    _print_thinking(block.thinking)
-                elif block.type == "text" and block.text.strip() and not seen_text:
-                    text = re.sub(r'<thinking>.*?</thinking>', '', block.text.strip(), flags=re.DOTALL).strip()
-                    if text:
-                        print(f"\n  💬 {text}", flush=True)
-                    seen_text = True
+                last_asst = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+                if last_asst and last_asst["content"] is resp.content:
+                    continue
+                messages.append({"role": "assistant", "content": resp.content})
 
-            has_tools = any(b.type == "tool_use" for b in resp.content)
-            if resp.stop_reason == "end_turn" and not has_tools:
-                print("\n  ⚠️  Stopped without done()..", flush=True)
-                messages.append({"role": "user", "content":
-                    "[system] Call done() or continue working toward the goal."})
-                continue
+                seen_text = False
+                for block in resp.content:
+                    if block.type == "thinking" and block.thinking.strip():
+                        _print_thinking(block.thinking)
+                    elif block.type == "text" and block.text.strip() and not seen_text:
+                        text = re.sub(r'<thinking>.*?</thinking>', '', block.text.strip(), flags=re.DOTALL).strip()
+                        if text:
+                            print(f"\n  💬 {text}", flush=True)
+                        seen_text = True
 
-            # ── Tool execution (ToolDispatcher) ──────────────────────
-            tool_blocks = [b for b in resp.content if b.type == "tool_use"]
-            all_results = disp.dispatch(tool_blocks, executor, memory, messages)
+                has_tools = any(b.type == "tool_use" for b in resp.content)
+                if resp.stop_reason == "end_turn" and not has_tools:
+                    print("\n  ⚠️  Stopped without done()..", flush=True)
+                    messages.append({"role": "user", "content":
+                        "[system] Call done() or continue working toward the goal."})
+                    continue
 
-            # ── Verifier feedback annotation ────────────────────
-            _annotations: dict[str, str] = {}
-            for block in tool_blocks:
-                out = all_results.get(block.id, "")
-                ok  = not any(out.startswith(p) for p in ("[error]", "[blocked]", "[safety_blocked]"))
-                obs = collect_observation(block.name, out)
+                # ── Tool execution ────────────────────────────────
+                tool_blocks = [b for b in resp.content if b.type == "tool_use"]
+                all_results = disp.dispatch(tool_blocks, executor, memory, messages)
 
-                if block.name == "verify":
-                    vr = verify_execution(block.name, obs)
-                    if not vr["success"]:
-                        recovery = route_from_verifier(vr["reason"])
-                        tracer.note(f"verify_failed: {vr['reason']} → {recovery.route}")
-                        memory.record_episode(f"verify_fail/{vr['reason']}", vr["evidence"], False)
-                        ann = (f"\n\n[Verifier] reason={vr['reason']}\n"
-                               f"evidence: {vr['evidence'][:120]}\n")
-                        fb = vr.get("feedback")
-                        if fb:
-                            ann += (f"error_type: {fb['error_type']}\n"
+                # ── Verifier feedback annotation ──────────────────
+                _annotations: dict[str, str] = {}
+                for block in tool_blocks:
+                    out = all_results.get(block.id, "")
+                    ok  = not any(out.startswith(p) for p in ("[error]", "[blocked]", "[safety_blocked]"))
+                    obs = collect_observation(block.name, out)
+
+                    if block.name == "verify":
+                        vr = verify_execution(block.name, obs)
+                        if not vr["success"]:
+                            recovery = route_from_verifier(vr["reason"])
+                            tracer.note(f"verify_failed: {vr['reason']} → {recovery.route}")
+                            memory.record_episode(f"verify_fail/{vr['reason']}", vr["evidence"], False)
+                            ann = (f"\n\n[Verifier] reason={vr['reason']}\n"
+                                   f"evidence: {vr['evidence'][:120]}\n")
+                            fb = vr.get("feedback")
+                            if fb:
+                                ann += (f"error_type: {fb['error_type']}\n"
+                                        f"root_cause: {fb['root_cause']}\n"
+                                        f"suggested_fix: {fb['suggested_fix']}\n"
+                                        f"retry_safe: {fb['retry_safe']}\n")
+                            ann += f"→ Next: {recovery.note}"
+                            _annotations[block.id] = ann
+
+                    elif block.name in ("bash", "script"):
+                        cmd = str(block.input.get("command", block.input.get("code", "")))
+                        if any(kw in cmd for kw in ("ros2 topic pub", "cmd_vel", "/drive")):
+                            mvr = verify_motion(obs["stdout"])
+                            if not mvr["success"]:
+                                tracer.note(f"motion_not_verified: {mvr['evidence'][:80]}")
+                                ann = f"\n\n[Motion verifier] not verified: {mvr['evidence'][:120]}"
+                                fb  = mvr.get("feedback") or {}
+                                if fb.get("suggested_fix"):
+                                    ann += f"\nsuggested_fix: {fb['suggested_fix']}"
+                                _annotations[block.id] = ann
+                        elif not ok:
+                            fb = parse_error_feedback(out)
+                            if fb:
+                                _annotations[block.id] = (
+                                    f"\n\n[Error feedback]\nerror_type: {fb['error_type']}\n"
                                     f"root_cause: {fb['root_cause']}\n"
                                     f"suggested_fix: {fb['suggested_fix']}\n"
-                                    f"retry_safe: {fb['retry_safe']}\n")
-                        ann += f"→ Next: {recovery.note}"
-                        _annotations[block.id] = ann
+                                    f"retry_safe: {fb['retry_safe']}"
+                                )
 
-                elif block.name in ("bash", "script"):
-                    cmd = str(block.input.get("command", block.input.get("code", "")))
-                    if any(kw in cmd for kw in ("ros2 topic pub", "cmd_vel", "/drive")):
-                        mvr = verify_motion(obs["stdout"])
-                        if not mvr["success"]:
-                            tracer.note(f"motion_not_verified: {mvr['evidence'][:80]}")
-                            ann = f"\n\n[Motion verifier] not verified: {mvr['evidence'][:120]}"
-                            fb  = mvr.get("feedback") or {}
-                            if fb.get("suggested_fix"):
-                                ann += f"\nsuggested_fix: {fb['suggested_fix']}"
-                            _annotations[block.id] = ann
-                    elif not ok:
-                        fb = parse_error_feedback(out)
-                        if fb:
-                            _annotations[block.id] = (
-                                f"\n\n[Error feedback]\nerror_type: {fb['error_type']}\n"
-                                f"root_cause: {fb['root_cause']}\n"
-                                f"suggested_fix: {fb['suggested_fix']}\n"
-                                f"retry_safe: {fb['retry_safe']}"
-                            )
+                    memory.record_episode(block.name, out, ok)
+                    memory.working.last_action = block.name
+                    memory.working.last_result = out[:50].replace("\n", " ")
+                    tracer.tool_use(name=block.name, inp_summary=str(block.input)[:100],
+                                    out_summary=out[:100], ok=ok)
 
-                memory.record_episode(block.name, out, ok)
-                memory.working.last_action = block.name
-                memory.working.last_result = out[:50].replace("\n", " ")
-                tracer.tool_use(name=block.name, inp_summary=str(block.input)[:100],
-                                out_summary=out[:100], ok=ok)
+                escalation.record_tool_results(tool_blocks, all_results)
 
-            escalation.record_tool_results(tool_blocks, all_results)
+                _in_prog = todos.in_progress_items()
+                if _in_prog:
+                    memory.working.current_step = _in_prog[0].content[:100]
 
-            _in_prog = todos.in_progress_items()
-            if _in_prog:
-                memory.working.current_step = _in_prog[0].content[:100]
+                tool_results = []
+                for block in tool_blocks:
+                    out = all_results.get(block.id, "[error] no result")
+                    ann = _annotations.get(block.id, "")
+                    tool_results.append({"type": "tool_result",
+                                         "tool_use_id": block.id,
+                                         "content": out + ann})
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
 
-            # assemble tool_results
-            tool_results = []
-            for block in tool_blocks:
-                out = all_results.get(block.id, "[error] no result")
-                ann = _annotations.get(block.id, "")
-                tool_results.append({"type": "tool_result",
-                                     "tool_use_id": block.id,
-                                     "content": out + ann})
-            if tool_results:
-                messages.append({"role": "user", "content": tool_results})
+                if executor.is_finished:
+                    state.messages = messages
+                    self._session.save(state)
+                    memory.checkpoint_clear()
 
-            if executor.is_finished:
-                state.messages = messages
-                self._session.save(state)
-                memory.checkpoint_clear()
+                    consolidate_episodic(memory, active_goal, self.client)
 
-                # v4: Episodic → Semantic auto-consolidation
-                consolidate_episodic(memory, active_goal, self.client)
+                    # [Fix 1] done()의 success 값을 실제로 반영
+                    # executor._done()이 self.is_finished = True로 세팅할 때
+                    # done(success=...) 인자는 이미 출력됐지만 여기서 추적하려면
+                    # executor에 _last_done_success 플래그를 추가하는 것이 가장 정확.
+                    # 현재 구조에서는 done()이 출력한 [OK]/[FAIL] 텍스트로 판단하거나,
+                    # all_results에서 "done" 툴 블록의 input을 확인.
+                    _done_block = next(
+                        (b for b in tool_blocks if b.name == "done"),
+                        None,
+                    )
+                    _done_success = _done_block.input.get("success", False) if _done_block else False
+                    _done_summary = _done_block.input.get("summary", "") if _done_block else ""
 
-                # v4: session cost tally + goal history record
-                tok_in, tok_out = tracer.get_token_totals()
-                tracer.session_end(success=True, summary=f"done() after {turn} turns")
-                record_goal(
-                    goal=active_goal,
-                    success=True,
-                    turns=turn,
-                    conn_address=self.conn.address if self.conn else "",
-                    tokens_in=tok_in,
-                    tokens_out=tok_out,
-                )
-                break
+                    _session_success = _done_success
+                    _session_summary = _done_summary
 
-            if self.conn and turn > 0 and turn % 10 == 0:
-                disp.check_connection(messages)
+                    _record_session_end(
+                        tracer=tracer,
+                        active_goal=active_goal,
+                        turn=turn,
+                        success=_session_success,
+                        conn=self.conn,
+                        summary=_session_summary,
+                    )
+                    break
 
-            memory.working.turn = turn
-            memory.checkpoint_save()  # preserve Working + Episodic each turn
-            turn += 1
-            if turn >= max_turns:
-                print(f"\n  ⚠️  {turn} turns — continuing...", flush=True)
-                messages.append({"role": "user", "content":
-                    f"[system] {turn} turns. Keep working. Call done() only when finished."})
-                max_turns += 50
+                if self.conn and turn > 0 and turn % _conn_check_interval() == 0:
+                    disp.check_connection(messages)
+
+                memory.working.turn = turn
+                memory.checkpoint_save()
+                turn += 1
+                if turn >= max_turns:
+                    print(f"\n  ⚠️  {turn} turns — continuing...", flush=True)
+                    messages.append({"role": "user", "content":
+                        f"[system] {turn} turns. Keep working. Call done() only when finished."})
+                    max_turns += _max_turns_step()
+
+        except Exception:
+            # [Fix 1] 예외로 종료될 때도 기록 (re-raise 전)
+            _record_session_end(
+                tracer=tracer,
+                active_goal=active_goal,
+                turn=turn,
+                success=False,
+                conn=self.conn,
+                summary=f"exception after {turn} turns",
+            )
+            raise
 
     def _save_partial_session(self):
         """Called by cli.py on KeyboardInterrupt."""

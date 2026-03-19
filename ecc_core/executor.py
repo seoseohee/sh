@@ -140,7 +140,7 @@ class ToolExecutor:
                 and "timeout" in result.stderr.lower()
                 and not background
             ):
-                retry_timeout = min(timeout * 2, 120)
+                retry_timeout = min(timeout * 2, _env_int("ECC_BASH_RETRY_MAX_TIMEOUT", 120))
                 print(f"    Timeout detected — retrying with {retry_timeout}s...", flush=True)
                 result = self.conn.run(cmd, timeout=retry_timeout)
 
@@ -307,7 +307,10 @@ class ToolExecutor:
             available = probe_registry.list_targets()
             return f"[error] Unknown probe target: {target}. Available: {available}"
 
-        timeout = 60 if target == "parallel_scan" else 45
+        timeout = (
+            _env_int("ECC_PROBE_SCAN_TIMEOUT", 60) if target == "parallel_scan"
+            else _env_int("ECC_PROBE_TIMEOUT", 45)
+        )
         result = self.conn.run(cmd, timeout=timeout)
         _print_result(result)
         return result.to_tool_result()
@@ -430,7 +433,8 @@ class ToolExecutor:
                 self._serial_sessions[session_id]["history"].append(
                     {"tx": data, "rx": out, "hex": hex_encode}
                 )
-                if len(self._serial_sessions[session_id]["history"]) > 50:
+                _hist_max = _env_int("ECC_SERIAL_HISTORY_MAX", 50)
+                if len(self._serial_sessions[session_id]["history"]) > _hist_max:
                     self._serial_sessions[session_id]["history"].pop(0)
 
         return result.to_tool_result()
@@ -525,38 +529,37 @@ class ToolExecutor:
 
     # ─── physical safety guard ─────────────────────────────────
 
-    # [Fix 1] 수치 추출 패턴 확장
-    #   기존: data["']: 표기만 커버
-    #   수정: ROS2 msg / JSON / YAML / Python dict / 직접 할당 등 포괄
+    # ─── physical safety guard 패턴 (클래스 레벨 컴파일) ─────
+    #
+    # [Fix 4] re.compile()을 매 호출마다 실행하지 않고 클래스 레벨에서 한 번만 컴파일.
+    #   기존: _physical_safety_check() 내부에서 매 호출마다 re.compile() 4회 실행
+    #   수정: 클래스 변수로 선언 → 모듈 임포트 시점에 1회만 컴파일
     #
     # 커버 예시:
-    #   data: 5000                          (YAML/ROS2 Int32 msg)
-    #   data=5000                           (Python/shell)
-    #   linear_x: 5000 / linear.x: 5000    (geometry_msgs flattened)
+    #   data: 5000 / data=5000              (YAML/ROS2 Int32 msg, Python/shell)
+    #   linear_x: 5000 / {linear: {x: 3.0}}(geometry_msgs flattened / nested YAML)
     #   velocity: 5000.0 / speed=5.0        (generic)
-    #   "speed": 5000                       (JSON)
-    #   {linear: {x: 3.0}}                 (ROS2 Twist nested YAML)
     #   current: 5.0 / temperature=90       (전류/온도)
-    _SPEED_FIELDS   = r"(?:linear[._]x|linear\s*:\s*\{[^}]*x|velocity|speed|vx|v_x)"
-    _ERPM_FIELDS    = r"(?:data|erpm|rpm|duty)"
-    _CURRENT_FIELDS = r"(?:current|amps?|amperage)"
-    _TEMP_FIELDS    = r"(?:temp(?:erature)?|thermal)"
-    # 수치 값 패턴: key: val  /  key=val  /  key: {x: val}  (nested YAML)
-    # {0,20} 한정으로 greedy 방지, 마지막 수치 캡처
-    _VAL_PATTERN    = r"""[\"']?\s*[:=]\s*\{?[^}]{0,20}?(-?\d+(?:\.\d+)?)"""
+    #   -4000 ERPM                          (음수 값)
+
+    import re as _re  # 클래스 변수 초기화를 위해 모듈 레벨에서 import
+
+    _VAL_PAT = r"""[\"']?\s*[:=]\s*\{?[^}]{0,20}?(-?\d+(?:\.\d+)?)"""
+
+    _RE_ERPM    = _re.compile(r"(?:data|erpm|rpm|duty)"          + _VAL_PAT, _re.IGNORECASE)
+    _RE_SPEED   = _re.compile(r"(?:linear[._]x|linear\s*:\s*\{[^}]*x|velocity|speed|vx|v_x)" + _VAL_PAT, _re.IGNORECASE)
+    _RE_CURRENT = _re.compile(r"(?:current|amps?|amperage)"      + _VAL_PAT, _re.IGNORECASE)
+    _RE_TEMP    = _re.compile(r"(?:temp(?:erature)?|thermal)"    + _VAL_PAT, _re.IGNORECASE)
 
     def _physical_safety_check(self, cmd: str) -> str:
-        """
-        Pre-execution physical constraint validation based on constraints memory.
+        """Pre-execution physical constraint validation based on constraints memory.
 
-        [Fix 1] 정규식 확장:
-          - 기존 data[":] 한 가지 패턴 → 필드명별 패턴 그룹으로 분리
-          - ERPM / 속도 / 전류 / 온도 각각 독립 체크
-          - 음수 값도 포괄 (-5000 ERPM 등)
+        [Fix 4] 정규식 패턴을 클래스 레벨에서 한 번만 컴파일.
+          기존: 매 호출마다 re.compile() 4회 실행 → 불필요한 반복 비용
+          수정: _RE_ERPM / _RE_SPEED / _RE_CURRENT / _RE_TEMP 클래스 변수로 캐싱
 
         Returns "" if safe, or a reason string if blocked.
         """
-        import re
         if self.memory is None:
             return ""
         constraints = self.memory.semantic.constraints
@@ -566,11 +569,7 @@ class ToolExecutor:
         # ── ERPM 상한 ─────────────────────────────────────────
         max_erpm = constraints.get("max_erpm")
         if max_erpm is not None:
-            pattern = re.compile(
-                self._ERPM_FIELDS + self._VAL_PATTERN,
-                re.IGNORECASE,
-            )
-            for m in pattern.finditer(cmd):
+            for m in self._RE_ERPM.finditer(cmd):
                 try:
                     val = float(m.group(1))
                     if abs(val) > float(max_erpm):
@@ -584,11 +583,7 @@ class ToolExecutor:
         # ── 속도 상한 ─────────────────────────────────────────
         max_speed = constraints.get("max_speed_ms") or constraints.get("max_speed")
         if max_speed is not None:
-            pattern = re.compile(
-                self._SPEED_FIELDS + self._VAL_PATTERN,
-                re.IGNORECASE,
-            )
-            for m in pattern.finditer(cmd):
+            for m in self._RE_SPEED.finditer(cmd):
                 try:
                     val = float(m.group(1))
                     if abs(val) > float(max_speed):
@@ -599,14 +594,10 @@ class ToolExecutor:
                 except ValueError:
                     pass
 
-        # ── 전류 상한 (선택적 제약) ───────────────────────────
+        # ── 전류 상한 ─────────────────────────────────────────
         max_current = constraints.get("max_current_a") or constraints.get("max_current")
         if max_current is not None:
-            pattern = re.compile(
-                self._CURRENT_FIELDS + self._VAL_PATTERN,
-                re.IGNORECASE,
-            )
-            for m in pattern.finditer(cmd):
+            for m in self._RE_CURRENT.finditer(cmd):
                 try:
                     val = float(m.group(1))
                     if abs(val) > float(max_current):
@@ -620,11 +611,7 @@ class ToolExecutor:
         # ── 온도 상한 ─────────────────────────────────────────
         max_temp = constraints.get("max_temp_c")
         if max_temp is not None:
-            pattern = re.compile(
-                self._TEMP_FIELDS + self._VAL_PATTERN,
-                re.IGNORECASE,
-            )
-            for m in pattern.finditer(cmd):
+            for m in self._RE_TEMP.finditer(cmd):
                 try:
                     val = float(m.group(1))
                     if val > float(max_temp):
@@ -733,7 +720,10 @@ def _print_tool(name: str, detail: str = "", desc: str = ""):
     desc_str = f"  # {desc}" if desc else ""
     print(f"\n  > {name}  {detail}{desc_str}", flush=True)
 
-def _print_result(result: ExecResult, max_chars: int = 4000):
+def _print_result(result: ExecResult, max_chars: int = None):
+    if max_chars is None:
+        import os as _os
+        max_chars = int(_os.environ.get("ECC_TOOL_OUTPUT_MAX_CHARS", 4000))
     out = result.output()
     if not out.strip():
         return

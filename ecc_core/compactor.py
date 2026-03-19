@@ -1,40 +1,41 @@
 """
 ecc_core/compactor.py
 
-Environment variables:
-  ECC_COMPACT_MODEL      압축 모델 (default: ECC_MODEL, fallback: claude-sonnet-4-6)
-  ECC_CONTEXT_LIMIT      컨텍스트 토큰 한계 (default: 모델별 자동)
-  ECC_COMPACT_TRIGGER    압축 트리거 비율 0~1 (default: 0.85)
-  ECC_COMPACT_MAX_TOKENS 압축 LLM 응답 한도 (default: 1500)
-
 Changelog:
   v2 — 한국어 토큰 추정 오류 수정.
-       기존 chars // 4는 영어 기준(1 token ≈ 4 chars).
-       한국어는 1 token ≈ 1~2 chars라서 실제의 절반 이하로 추정됨.
-       결과: 압축 트리거 지연 → BadRequestError.
-       수정: estimate_tokens()에 언어별 가중치 적용.
   v3 — COMPACT_TRIGGER_RATIO, max_tokens env 오버라이드 추가.
-       max_tokens 800 → 1500으로 상향 (긴 세션 요약 잘림 방지).
   v4 — [Fix 5] Episode 중요도 기반 히스토리 선택.
-       기존: 마지막 120줄만 사용 → 초반 중요 발견(보드 IP, 첫 하드웨어 탐지)이 잘림.
-       수정:
-         1. 메시지 → 라인 변환 시 Episode 중요도 점수 병기
-         2. "중요도 상위 N개 + 최근 M개" 혼합 선택으로 초반 핵심 정보 보존
-         3. _select_history_lines() 함수로 선택 로직 분리
+  v5 — [Fix 3] _select_history_lines total_max 초과 시 중요 라인 우선 보호.
+         기존: sorted(union)[-total_max:]으로 자르면 앞쪽 important_indices 소실 가능.
+         수정: important_indices 먼저 확정 → 남은 슬롯을 recent 최신순으로 채움.
 """
 
 import os
 import re
 import anthropic
 
-_DEFAULT_LIMIT = 180_000
-_DEFAULT_COMPACT_TRIGGER = 0.85
+_DEFAULT_LIMIT            = 180_000
+_DEFAULT_COMPACT_TRIGGER  = 0.85
 _DEFAULT_COMPACT_MAX_TOKENS = 1500
 
-# [Fix 5] 히스토리 선택 파라미터
-_HISTORY_RECENT_N   = 80   # 최신 N줄은 무조건 포함
-_HISTORY_IMPORTANT_N = 40  # 중요도 상위 N줄 추가 포함 (중복 제거)
-_HISTORY_TOTAL_MAX  = 120  # 전체 상한선 (기존과 동일)
+# [env override] 히스토리 선택 파라미터
+# 기본값은 모듈 상수로 유지하되 런타임에 env로 오버라이드 가능
+_HISTORY_RECENT_N    = 80
+_HISTORY_IMPORTANT_N = 40
+_HISTORY_TOTAL_MAX   = 120
+
+
+def _history_recent_n() -> int:
+    """최신 라인 유지 수. ECC_HISTORY_RECENT_N으로 오버라이드."""
+    return int(os.environ.get("ECC_HISTORY_RECENT_N", _HISTORY_RECENT_N))
+
+def _history_important_n() -> int:
+    """중요도 상위 유지 수. ECC_HISTORY_IMPORTANT_N으로 오버라이드."""
+    return int(os.environ.get("ECC_HISTORY_IMPORTANT_N", _HISTORY_IMPORTANT_N))
+
+def _history_total_max() -> int:
+    """히스토리 전체 상한. ECC_HISTORY_TOTAL_MAX으로 오버라이드."""
+    return int(os.environ.get("ECC_HISTORY_TOTAL_MAX", _HISTORY_TOTAL_MAX))
 
 
 def _compact_model() -> str:
@@ -44,10 +45,8 @@ def _compact_model() -> str:
 def _context_limit() -> int:
     env = os.environ.get("ECC_CONTEXT_LIMIT")
     if env:
-        try:
-            return int(env)
-        except ValueError:
-            pass
+        try: return int(env)
+        except ValueError: pass
     return _DEFAULT_LIMIT
 
 def _compact_trigger() -> float:
@@ -55,31 +54,20 @@ def _compact_trigger() -> float:
     if env:
         try:
             v = float(env)
-            if 0 < v < 1:
-                return v
-        except ValueError:
-            pass
+            if 0 < v < 1: return v
+        except ValueError: pass
     return _DEFAULT_COMPACT_TRIGGER
 
 def _compact_max_tokens() -> int:
     env = os.environ.get("ECC_COMPACT_MAX_TOKENS")
     if env:
-        try:
-            return int(env)
-        except ValueError:
-            pass
+        try: return int(env)
+        except ValueError: pass
     return _DEFAULT_COMPACT_MAX_TOKENS
 
 
 def estimate_tokens(messages: list[dict]) -> int:
-    """
-    메시지 리스트의 토큰 수 추정.
-
-    언어별 char-to-token 비율 적용:
-      - ASCII (영어/코드): 4 chars ≈ 1 token
-      - 한국어/일본어/중국어: 1~2 chars ≈ 1 token → 2 chars per token
-      - 기타 유니코드: 3 chars ≈ 1 token (보수적 추정)
-    """
+    """메시지 리스트의 토큰 수 추정."""
     total = 0
     for m in messages:
         content = m.get("content", "")
@@ -109,12 +97,7 @@ def _count_tokens(text: str) -> int:
         or (0x3040 <= ord(ch) <= 0x30FF)
     )
     other_chars = len(text) - ascii_chars - cjk_chars
-
-    tokens = (
-        ascii_chars // 4
-        + cjk_chars  // 2
-        + other_chars // 3
-    )
+    tokens = (ascii_chars // 4 + cjk_chars // 2 + other_chars // 3)
     return max(tokens, len(text) // 4)
 
 
@@ -123,38 +106,22 @@ def should_compact(messages: list[dict]) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# [Fix 5] Episode 중요도 기반 히스토리 라인 선택
+# Episode 중요도 기반 히스토리 라인 선택
 # ─────────────────────────────────────────────────────────────
 
 def _importance_score_for_line(line: str) -> float:
-    """
-    텍스트 라인의 중요도 휴리스틱 점수 반환 (0.0 ~ 1.0).
-
-    메모리의 Episode.importance와 동일한 기준을 텍스트 기반으로 재현:
-      - 연결/발견 이벤트: 높음 (ssh_connect, found, /dev/, IP 주소)
-      - 실패 이벤트: 높음 (FAIL, error, rc=-1)
-      - 검증 성공: 중간 (PASS, verified, connected)
-      - 일반 bash 출력: 낮음
-    """
+    """텍스트 라인의 중요도 휴리스틱 점수 반환 (0.0 ~ 1.0)."""
     l = line.lower()
-
-    # 최고 중요도: 연결 이벤트, 하드웨어 발견
     if any(kw in l for kw in ("ssh_connect", "connected to", "discovered")):
         return 1.0
     if re.search(r'/dev/\w+', l):
         return 0.9
     if re.search(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', l):
         return 0.85
-
-    # 높은 중요도: 실패 이벤트
     if any(kw in l for kw in ("fail", "error", "rc=-1", "exception", "blocked", "safety")):
         return 0.8
-
-    # 중간 중요도: 검증/발견 성공
     if any(kw in l for kw in ("pass", "verified", "remember", "constraint", "found", "ok]")):
         return 0.6
-
-    # 툴 종류별 기본 중요도
     if l.startswith("[tool:remember") or l.startswith("[tool:probe"):
         return 0.7
     if l.startswith("[tool:verify"):
@@ -165,51 +132,45 @@ def _importance_score_for_line(line: str) -> float:
         return 1.0
     if l.startswith("[tool:bash"):
         return 0.3
-
     return 0.2
 
 
 def _select_history_lines(
-    all_lines: list[str],
+    all_lines:   list[str],
     recent_n:    int = _HISTORY_RECENT_N,
     important_n: int = _HISTORY_IMPORTANT_N,
     total_max:   int = _HISTORY_TOTAL_MAX,
 ) -> list[str]:
-    """
-    [Fix 5] 중요도 기반 + 최신 우선 혼합 선택.
+    """중요도 기반 + 최신 우선 혼합 선택.
 
-    전략:
-      1. 마지막 recent_n 줄 → 최신 컨텍스트 보존
-      2. 나머지 줄 중 중요도 상위 important_n 줄 → 초반 핵심 발견 보존
-      3. 두 집합을 원래 순서(인덱스 기준)로 합쳐서 반환
-      4. 전체 total_max 초과 시 잘라냄
+    [Fix 3] total_max 초과 시 important_indices 우선 보호.
 
-    기존 behavior (마지막 120줄만):
-      긴 세션에서 "IP 확인, 하드웨어 탐지" 등 초반 중요 이벤트 소실 가능
+    알고리즘:
+      1. recent_indices  = 마지막 recent_n 개 인덱스
+      2. important_indices = 나머지 중 중요도 상위 important_n 개
+      3. total_max 초과 시:
+           - important_indices 전부 보존 (절대 제거 안 함)
+           - 남은 슬롯 = total_max - len(important_indices)
+           - recent_indices에서 가장 최신(인덱스 큰 것)부터 슬롯만큼만 포함
 
-    개선 behavior:
-      최신 80줄 + 중요도 높은 과거 40줄로 구성 → 핵심 발견 보존
+    기존 방식 [-total_max:] 문제:
+      important_indices가 앞쪽(낮은 인덱스)에 있을 때
+      sorted union을 뒤에서 자르면 통째로 제거될 수 있음.
     """
     if len(all_lines) <= total_max:
         return all_lines
 
-    recent_indices  = set(range(max(0, len(all_lines) - recent_n), len(all_lines)))
-    remaining_lines = [
-        (i, line) for i, line in enumerate(all_lines)
-        if i not in recent_indices
-    ]
-
-    # 중요도 점수로 정렬 후 상위 important_n 선택
-    scored = sorted(remaining_lines, key=lambda x: _importance_score_for_line(x[1]), reverse=True)
+    recent_indices    = set(range(max(0, len(all_lines) - recent_n), len(all_lines)))
+    remaining         = [(i, l) for i, l in enumerate(all_lines) if i not in recent_indices]
+    scored            = sorted(remaining, key=lambda x: _importance_score_for_line(x[1]), reverse=True)
     important_indices = {i for i, _ in scored[:important_n]}
 
-    # 원래 순서 유지하여 합치기
-    selected_indices = sorted(recent_indices | important_indices)
+    # [Fix 3] important를 전부 보존, 남은 슬롯을 recent 최신순으로 채움
+    n_recent_slots   = max(0, total_max - len(important_indices))
+    recent_sorted    = sorted(recent_indices, reverse=True)   # 최신(높은 인덱스) 우선
+    selected_recent  = set(recent_sorted[:n_recent_slots])
 
-    # total_max 초과 시 뒤에서 자르기
-    if len(selected_indices) > total_max:
-        selected_indices = selected_indices[-total_max:]
-
+    selected_indices = sorted(important_indices | selected_recent)
     return [all_lines[i] for i in selected_indices]
 
 
@@ -220,19 +181,13 @@ def compact(
     client: anthropic.Anthropic,
     persistent_facts: str = "",
 ) -> list[dict]:
-    """
-    메시지 히스토리 압축.
-
-    persistent_facts: ECCMemory.get_persistent_facts() 결과.
-    물리적 제약, 하드웨어 사실 등 압축 후에도 반드시 보존해야 할 정보.
-    """
+    """메시지 히스토리 압축."""
     print("\n  📦 Compacting context......", flush=True)
 
     history_lines: list[str] = []
     for m in messages[1:]:
-        role = m.get("role", "")
+        role    = m.get("role", "")
         content = m.get("content", "")
-
         if isinstance(content, str):
             history_lines.append(f"[{role}] {content[:400]}")
         elif isinstance(content, list):
@@ -243,17 +198,21 @@ def compact(
                 if btype == "text":
                     history_lines.append(f"[{role}/text] {block.get('text', '')[:300]}")
                 elif btype == "tool_use":
-                    name = block.get("name", "")
-                    inp = block.get("input", {})
+                    name   = block.get("name", "")
+                    inp    = block.get("input", {})
                     detail = inp.get("command", inp.get("code", inp.get("path", str(inp))))[:120]
                     history_lines.append(f"[tool:{name}] {detail}")
                 elif btype == "tool_result":
                     out = str(block.get("content", ""))[:200]
                     history_lines.append(f"[result] {out}")
 
-    # [Fix 5] 단순 마지막 120줄 대신 중요도 기반 혼합 선택
-    selected_lines = _select_history_lines(history_lines)
-    history_text = "\n".join(selected_lines)
+    selected_lines = _select_history_lines(
+        history_lines,
+        recent_n    = _history_recent_n(),
+        important_n = _history_important_n(),
+        total_max   = _history_total_max(),
+    )
+    history_text   = "\n".join(selected_lines)
 
     _total   = len(history_lines)
     _kept    = len(selected_lines)
@@ -261,8 +220,7 @@ def compact(
     if _dropped > 0:
         print(
             f"  📊 History selection: {_kept}/{_total} lines kept "
-            f"(recent={min(_HISTORY_RECENT_N, _total)} + "
-            f"important={_kept - min(_HISTORY_RECENT_N, _total)}, "
+            f"(recent≤{_history_recent_n()} + important≤{_history_important_n()}, "
             f"dropped={_dropped} low-importance lines)",
             flush=True,
         )
