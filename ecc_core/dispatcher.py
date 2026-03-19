@@ -355,7 +355,7 @@ class ToolDispatcher:
             self.conn._consecutive_failures = 0
             return
         print("\n  🔄 Connection lost, attempting reconnect......", flush=True)
-        if self.conn.reconnect(max_attempts=3):
+        if self.conn.reconnect():  # max_attempts는 ECC_SSH_RECONNECT_ATTEMPTS env로 제어
             print("  ✅ Reconnect succeeded")
             messages.append({"role": "user", "content": "[SSH reconnected] Check board state."})
         else:

@@ -32,6 +32,14 @@ if TYPE_CHECKING:
     pass
 
 
+def _env_int(key: str, default: int) -> int:
+    """환경변수에서 정수 읽기. 실패 시 default 반환."""
+    try:
+        return int(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
 @dataclass
 class _BgTask:
     task_id: str

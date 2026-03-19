@@ -11,16 +11,22 @@ Classify failure type and decide 3-way replanning destination:
 classify_failure()  : classify failure type from recent tool_result text
 generate_reflection(): call LLM to generate verbal failure analysis
 make_reflection_message(): create user message to inject into loop.py messages
+
+Changelog:
+  v2 — [Fix 2] generate_reflection() docstring 위치 버그 수정
+         기존: if not model 블록 다음에 docstring이 위치
+               → 문자열 리터럴로만 처리되어 help()/IDE 문서화가 깨짐
+         수정: docstring을 함수 첫 줄로 이동, model 기본값 처리는 그 아래로
 """
 
+import os
 import anthropic
+from dataclasses import dataclass
 
 
 # ─────────────────────────────────────────────────────────────
 # Replan Decision constants + typed dataclass
 # ─────────────────────────────────────────────────────────────
-
-from dataclasses import dataclass
 
 class ReplanDecision:
     RETRY_SAME_TASK   = "retry"   # same tool, change parameters only
@@ -43,7 +49,6 @@ class RecoveryDecision:
 
 # ─────────────────────────────────────────────────────────────
 # verifier reason → RecoveryDecision mapping
-# (recovery.py pattern integrated into reflection.py)
 # ─────────────────────────────────────────────────────────────
 
 _VERIFIER_ROUTING: dict[str, RecoveryDecision] = {
@@ -71,10 +76,7 @@ _VERIFIER_ROUTING: dict[str, RecoveryDecision] = {
 
 
 def route_from_verifier(verifier_reason: str) -> RecoveryDecision:
-    """verifier.py reason → RecoveryDecision.
-
-    Directly convert verify_execution() result to recovery decision.
-    """
+    """verifier.py reason → RecoveryDecision."""
     return _VERIFIER_ROUTING.get(
         verifier_reason,
         RecoveryDecision(
@@ -86,7 +88,6 @@ def route_from_verifier(verifier_reason: str) -> RecoveryDecision:
 
 
 # failure keyword → replan destination
-# match priority: top to bottom
 FAILURE_ROUTING: list[tuple[str, str]] = [
     # ── transient connection/execution errors → retry
     ("timeout after",        ReplanDecision.RETRY_SAME_TASK),
@@ -114,7 +115,6 @@ FAILURE_ROUTING: list[tuple[str, str]] = [
     ("exit code 127",        ReplanDecision.REPLAN_FROM_ROOT),
 ]
 
-# Action hints per replan decision
 _ACTION_HINT: dict[str, str] = {
     ReplanDecision.RETRY_SAME_TASK: (
         "The failure looks transient (connection/timeout). "
@@ -137,8 +137,8 @@ _ACTION_HINT: dict[str, str] = {
 # ─────────────────────────────────────────────────────────────
 
 def classify_failure(recent_results: list[str]) -> str:
-    """
-    Classify failure type from recent tool_result text.
+    """Classify failure type from recent tool_result text.
+
     No match → REPLAN_FROM_ROOT (unknown, LLM decides).
     """
     combined = " ".join(r.lower() for r in recent_results[-4:])
@@ -159,14 +159,19 @@ def generate_reflection(
     client: anthropic.Anthropic,
     model: str = "",
 ) -> str:
-    if not model:
-        import os
-        model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
-    """
-    Reflexion pattern — generate verbal failure reason.
+    """Reflexion pattern — generate verbal failure reason.
+
     Called when EscalationTracker fires.
     Result injected into messages is seen by LLM next turn.
+
+    [Fix 2] docstring을 함수 첫 줄로 이동.
+    기존 코드에서는 `if not model:` 블록 다음에 docstring이 위치해
+    Python이 이를 docstring이 아닌 문자열 리터럴로 처리했음.
     """
+    # [Fix 2] model 기본값 처리 — docstring 이후로 이동
+    if not model:
+        model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
+
     # Use only last 6 messages (cost saving)
     recent = messages[-6:] if len(messages) >= 6 else messages
 
@@ -205,8 +210,8 @@ def generate_reflection(
 # ─────────────────────────────────────────────────────────────
 
 def make_reflection_message(reflection_text: str, decision: str) -> dict:
-    """
-    Inject reflection result as user message into loop.py messages.
+    """Inject reflection result as user message into loop.py messages.
+
     Agent sees this next turn and takes a different approach.
     """
     action = {
