@@ -7,6 +7,14 @@ LLM analyzes failed episode patterns and auto-saves to failed/constraints namesp
 References:
   - Voyager / MetaGPT: episode traces → reusable skills/rules abstraction
   - AgeMem (Yu et al., 2026): memory summarize as agent tool
+
+Changelog:
+  v2 — [Fix] 임계값 하드코딩 제거.
+         기존: `importance >= 0.9` 리터럴이 _TOOL_IMPORTANCE 상수와 암묵적 결합.
+               _TOOL_IMPORTANCE 값 변경 시 의도치 않은 동작 변경 가능.
+         수정: CRITICAL_IMPORTANCE_THRESHOLD 명시적 상수로 분리.
+               ECC_CRITICAL_IMPORTANCE_THRESHOLD 환경변수로 오버라이드 가능.
+               docstring으로 어떤 tool이 해당 임계값에 걸리는지 명시.
 """
 
 import json
@@ -20,6 +28,35 @@ from .memory import ECCMemory
 def _consolidation_model() -> str:
     return os.environ.get("ECC_COMPACT_MODEL",
            os.environ.get("ECC_MODEL", "claude-sonnet-4-6"))
+
+
+# ─────────────────────────────────────────────────────────────
+# [Fix] 임계값 상수 — _TOOL_IMPORTANCE와의 결합을 명시적으로 관리
+# ─────────────────────────────────────────────────────────────
+
+def _critical_importance_threshold() -> float:
+    """단발성 치명 실패의 min_failures 우회 임계값.
+
+    기본값 0.9의 근거 (_TOOL_IMPORTANCE 기준):
+      임계값 이상 (≥ 0.9):
+        remember     = 0.9   → 실패 시 0.9  (우회 대상 ✓)
+        ssh_connect  = 0.9   → 실패 시 1.0  (우회 대상 ✓)
+        done         = 1.0   → 실패 시 1.0  (우회 대상 ✓)
+        verify(실패) = 0.8 + 0.2 보정 = 1.0 (우회 대상 ✓)
+        probe(실패)  = 0.8 + 0.2 보정 = 1.0 (우회 대상 ✓)
+
+      임계값 미만 (< 0.9):
+        script(실패) = 0.5 + 0.2 = 0.7  (우회 안 됨 ✗ — 오탐 방지)
+        bash(실패)   = 0.3 + 0.2 = 0.5  (우회 안 됨 ✗ — 오탐 방지)
+        todo(실패)   = 0.2 + 0.2 = 0.4  (우회 안 됨 ✗ — 오탐 방지)
+
+    _TOOL_IMPORTANCE 기본값을 변경할 경우 이 임계값도 함께 검토 필요.
+    ECC_CRITICAL_IMPORTANCE_THRESHOLD 환경변수로 런타임 오버라이드 가능.
+    """
+    try:
+        return float(os.environ.get("ECC_CRITICAL_IMPORTANCE_THRESHOLD", 0.9))
+    except (ValueError, TypeError):
+        return 0.9
 
 
 def consolidate_episodic(
@@ -36,19 +73,19 @@ def consolidate_episodic(
       goal:         goal for this session (for context)
       client:       Anthropic client
       min_failures: skip pattern extraction below this count (noise prevention).
-                    단, importance >= 0.9인 치명 실패가 하나라도 있으면 개수 무관하게 통합.
+                    단, importance >= CRITICAL_IMPORTANCE_THRESHOLD인 치명 실패가
+                    하나라도 있으면 개수 무관하게 통합.
 
     Returns:
       {"failed": N, "constraints": M}  — number of items saved
     """
     failed_eps = [e for e in memory.episodic if not e.ok]
 
-    # importance >= 0.9인 단발성 치명 실패(hardware_fault, done=fail,
-    # verify/probe 실패 등)는 min_failures 미만이어도 통합 수행.
-    # 기준값 0.9: _TOOL_IMPORTANCE에서 remember/ssh_connect=0.9, done=1.0이
-    # 해당하며, 실패 시 +0.2 보정으로 verify(0.8→1.0), probe(0.8→1.0)도 포함.
-    # 일반 bash(0.3→0.5)는 포함되지 않아 오탐을 방지한다.
-    has_critical = any(e.importance >= 0.9 for e in failed_eps)
+    # [Fix] 하드코딩 0.9 → 함수 호출로 교체
+    # 임계값과 해당하는 tool 목록은 _critical_importance_threshold() docstring 참조
+    threshold    = _critical_importance_threshold()
+    has_critical = any(e.importance >= threshold for e in failed_eps)
+
     if len(failed_eps) < min_failures and not has_critical:
         return {"failed": 0, "constraints": 0}
 
@@ -88,7 +125,6 @@ Rules:
             messages=[{"role": "user", "content": prompt}]
         )
         raw = resp.content[0].text.strip() if resp.content else ""
-        # JSON parse
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         if not m:
             return {"failed": 0, "constraints": 0}
@@ -103,7 +139,6 @@ Rules:
         key = str(item.get("key", "")).strip()
         val = str(item.get("value", "")).strip()
         if key and val:
-            # Don't overwrite existing keys
             if not memory.semantic.get("failed", key):
                 memory.remember("failed", key, val)
                 saved_failed += 1
@@ -140,7 +175,7 @@ def consolidate_skill(
         return
     existing = memory.semantic.get("skill", key)
     if existing:
-        return  # Don't overwrite if already exists
+        return
     memory.remember("skill", key, {
         "code":        script_code[:2000],
         "description": description[:200],

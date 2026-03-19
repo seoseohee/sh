@@ -21,6 +21,15 @@ Changelog:
          수정: done(success=False), max_turns 초과, KeyboardInterrupt 등
                모든 세션 종료 경로에서 record_goal 호출
          구현: _record_session_end() 헬퍼로 중앙화
+  v6 — [Fix] except Exception → except BaseException
+         기존: KeyboardInterrupt가 Exception 서브클래스가 아니므로
+               Ctrl+C 시 _record_session_end() 미호출, history.jsonl 미기록
+         수정: except BaseException으로 변경 → KeyboardInterrupt도 포함
+       [Fix] set_running() 호출 추가
+         기존: session.py의 _current_state_snapshot()이 None 반환
+               → KeyboardInterrupt 시 partial-save 무동작
+         수정: 매 턴 turn += 1 직전에 self._session.set_running() 호출
+               → session.py 패치와 연동되어 partial-save 정상 동작
 """
 
 import os
@@ -91,15 +100,12 @@ def _thinking_params(model: str) -> dict:
            {"type": "enabled", "budget_tokens": _thinking_budget()}
 
 def _rate_limit_wait() -> int:
-    """RateLimitError 대기 시간(초). ECC_RATE_LIMIT_WAIT로 오버라이드."""
     return _env_int("ECC_RATE_LIMIT_WAIT", 60)
 
 def _conn_check_interval() -> int:
-    """SSH 연결 체크 주기(턴). ECC_CONN_CHECK_INTERVAL로 오버라이드."""
     return _env_int("ECC_CONN_CHECK_INTERVAL", 10)
 
 def _max_turns_step() -> int:
-    """최대 턴 초과 시 확장량. ECC_MAX_TURNS_STEP으로 오버라이드."""
     return _env_int("ECC_MAX_TURNS_STEP", 50)
 
 
@@ -115,17 +121,6 @@ def _record_session_end(
     conn:         "BoardConnection | None",
     summary:      str = "",
 ) -> None:
-    """
-    모든 세션 종료 경로에서 tracer + record_goal을 일관되게 호출.
-
-    기존 문제:
-      - done(success=True) 경로만 record_goal 호출
-      - done(success=False), max_turns 초과, KeyboardInterrupt 등은 미기록
-
-    수정:
-      - run() 내의 모든 break / return 경로에서 이 함수를 호출
-      - success=False일 때도 history.jsonl에 기록됨
-    """
     tok_in, tok_out = tracer.get_token_totals()
     tracer.session_end(
         success=success,
@@ -251,10 +246,10 @@ class AgentLoop:
         _retry_count       = 0
         _last_retry_reason = ""
 
-        # [Fix 1] 세션 결과 추적 — 루프 정상 종료 / 비정상 종료 모두 처리
         _session_success = False
         _session_summary = ""
 
+        # [v6 Fix] except BaseException으로 KeyboardInterrupt 포함
         try:
             while True:
 
@@ -446,12 +441,6 @@ class AgentLoop:
 
                     consolidate_episodic(memory, active_goal, self.client)
 
-                    # [Fix 1] done()의 success 값을 실제로 반영
-                    # executor._done()이 self.is_finished = True로 세팅할 때
-                    # done(success=...) 인자는 이미 출력됐지만 여기서 추적하려면
-                    # executor에 _last_done_success 플래그를 추가하는 것이 가장 정확.
-                    # 현재 구조에서는 done()이 출력한 [OK]/[FAIL] 텍스트로 판단하거나,
-                    # all_results에서 "done" 툴 블록의 input을 확인.
                     _done_block = next(
                         (b for b in tool_blocks if b.name == "done"),
                         None,
@@ -477,6 +466,8 @@ class AgentLoop:
 
                 memory.working.turn = turn
                 memory.checkpoint_save()
+                # [v6 Fix] KeyboardInterrupt partial-save를 위해 매 턴 상태 갱신
+                self._session.set_running(messages, active_goal, todos, executor, memory)
                 turn += 1
                 if turn >= max_turns:
                     print(f"\n  ⚠️  {turn} turns — continuing...", flush=True)
@@ -484,8 +475,9 @@ class AgentLoop:
                         f"[system] {turn} turns. Keep working. Call done() only when finished."})
                     max_turns += _max_turns_step()
 
-        except Exception:
-            # [Fix 1] 예외로 종료될 때도 기록 (re-raise 전)
+        except BaseException:
+            # [v6 Fix] except BaseException: KeyboardInterrupt 포함 모든 비정상 종료 기록
+            # 기존 except Exception은 KeyboardInterrupt를 잡지 못해 history.jsonl 미기록
             _record_session_end(
                 tracer=tracer,
                 active_goal=active_goal,
